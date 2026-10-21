@@ -15,7 +15,6 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from "react"
-import Visualizer from "./components/Visualizer"
 import { useAudioRecorder } from "./hooks/useAudioRecorder"
 import { playBlip } from "./utils/audio-blip"
 import {
@@ -29,19 +28,128 @@ import {
   saveAndTestGeminiKey,
 } from "./utils/api"
 
-const LANG_COLORS = {
-  te: { bg: "rgba(16, 185, 129, 0.16)", border: "#10b981", text: "#34d399" },
-  en: { bg: "rgba(59, 130, 246, 0.16)", border: "#3b82f6", text: "#60a5fa" },
-  hi: { bg: "rgba(245, 158, 11, 0.16)", border: "#f59e0b", text: "#fbbf24" },
+const LANG_META = {
+  te: {
+    name: "Telugu",
+    bg: "rgba(16, 185, 129, 0.12)",
+    border: "rgba(16, 185, 129, 0.35)",
+    text: "#34d399",
+    dot: "#10b981",
+  },
+  en: {
+    name: "English",
+    bg: "rgba(99, 102, 241, 0.12)",
+    border: "rgba(99, 102, 241, 0.35)",
+    text: "#818cf8",
+    dot: "#6366f1",
+  },
+  hi: {
+    name: "Hindi",
+    bg: "rgba(245, 158, 11, 0.12)",
+    border: "rgba(245, 158, 11, 0.35)",
+    text: "#fbbf24",
+    dot: "#f59e0b",
+  },
 }
 
 function getLangStyle(code) {
   return (
-    LANG_COLORS[code] || {
-      bg: "rgba(148, 163, 184, 0.16)",
-      border: "#64748b",
+    LANG_META[code] || {
+      name: code?.toUpperCase() || "Speech",
+      bg: "rgba(148, 163, 184, 0.12)",
+      border: "rgba(148, 163, 184, 0.3)",
       text: "#cbd5e1",
+      dot: "#94a3b8",
     }
+  )
+}
+
+function getInitials(label = "") {
+  const parts = label.trim().split(/\s+/)
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase()
+  }
+  return label.slice(0, 2).toUpperCase() || "S1"
+}
+
+/**
+ * Clean, modern audio frequency visualizer for the floating studio dock.
+ */
+function StudioWaveform({ isRecording, analyser }) {
+  const canvasRef = useRef(null)
+  const animRef = useRef(null)
+
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext("2d")
+    const bars = 28
+
+    const renderIdle = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+      const gap = 3
+      const barW = (canvas.width - gap * (bars - 1)) / bars
+      const cy = canvas.height / 2
+      ctx.fillStyle = "rgba(148, 163, 184, 0.25)"
+      for (let i = 0; i < bars; i++) {
+        const x = i * (barW + gap)
+        ctx.beginPath()
+        ctx.roundRect(x, cy - 1.5, barW, 3, 1.5)
+        ctx.fill()
+      }
+    }
+
+    if (!isRecording || !analyser) {
+      if (animRef.current) cancelAnimationFrame(animRef.current)
+      renderIdle()
+      return
+    }
+
+    const bufferLength = analyser.frequencyBinCount
+    const dataArray = new Uint8Array(bufferLength)
+
+    const renderLive = () => {
+      animRef.current = requestAnimationFrame(renderLive)
+      analyser.getByteFrequencyData(dataArray)
+      ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+      const gap = 3
+      const barW = (canvas.width - gap * (bars - 1)) / bars
+      const cy = canvas.height / 2
+      const maxBin = Math.floor(bufferLength * 0.7)
+      const binsPerBar = Math.max(1, Math.floor(maxBin / bars))
+
+      for (let i = 0; i < bars; i++) {
+        let sum = 0
+        for (let j = 0; j < binsPerBar; j++) {
+          sum += dataArray[i * binsPerBar + j] || 0
+        }
+        const avg = sum / binsPerBar
+        const norm = Math.min(1, avg / 210)
+        const h = Math.max(3, norm * (canvas.height - 4))
+        const x = i * (barW + gap)
+        const y = cy - h / 2
+
+        ctx.fillStyle = norm > 0.15 ? "#6366f1" : "rgba(148, 163, 184, 0.35)"
+        ctx.beginPath()
+        ctx.roundRect(x, y, barW, h, 2)
+        ctx.fill()
+      }
+    }
+
+    renderLive()
+    return () => {
+      if (animRef.current) cancelAnimationFrame(animRef.current)
+    }
+  }, [isRecording, analyser])
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={140}
+      height={28}
+      className="pro-waveform-canvas"
+    />
   )
 }
 
@@ -61,29 +169,19 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   const [turns, setTurns] = useState([])
   const [speakers, setSpeakers] = useState([])
   const [inFlightCount, setInFlightCount] = useState(0)
-  const [statusMessage, setStatusMessage] = useState(
-    "Ready — Click Record or Auto-Listen for instant Telugu, English & Hindi transcription",
-  )
+  const [statusMessage, setStatusMessage] = useState("Ready to transcribe")
 
-  // "roman" = English script for Telugu, Hindi & English (default)
-  // "native" = Native script (తెలుగు / हिन्दी / English)
   const [scriptMode, setScriptMode] = useState(
     () => localStorage.getItem("transcriber_script_mode") || "roman",
   )
-
-  // "feed" = Diarized Speaker Cards, "document" = Full Text Document
   const [viewMode, setViewMode] = useState("feed")
-
-  // Active language filter preset: ["te", "en", "hi"] by default
   const [selectedLangs, setSelectedLangs] = useState(["te", "en", "hi"])
-
-  // Recording elapsed timer
   const [recordingSeconds, setRecordingSeconds] = useState(0)
 
   // Gemini API Key state
   const [hasServerKey, setHasServerKey] = useState(false)
   const [maskedServerKey, setMaskedServerKey] = useState("")
-  const [showKeyModal, setShowKeyModal] = useState(false)
+  const [showKeyEditor, setShowKeyEditor] = useState(false)
   const [keyInput, setKeyInput] = useState(() => config.geminiApiKey || "")
   const [isTestingKey, setIsTestingKey] = useState(false)
   const [keyFeedback, setKeyFeedback] = useState(null)
@@ -91,6 +189,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   // Speaker rename & voice enrollment state
   const [editingSpeakerId, setEditingSpeakerId] = useState(null)
   const [renameValue, setRenameValue] = useState("")
+  const [showEnrollInput, setShowEnrollInput] = useState(false)
   const [enrollingName, setEnrollingName] = useState("")
   const [isEnrollingRecord, setIsEnrollingRecord] = useState(false)
   const [copiedId, setCopiedId] = useState(null)
@@ -125,7 +224,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           (config.asrEngine || "gemini-cloud") === "gemini-cloud" &&
           !config.geminiApiKey
         ) {
-          setShowKeyModal(true)
+          setShowKeyEditor(true)
         }
       })
       .catch(() => {})
@@ -170,7 +269,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         setMaskedServerKey(
           trimmed.length > 10
             ? `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`
-            : "Saved",
+            : "Active",
         )
         setConfig((prev) => ({
           ...prev,
@@ -179,16 +278,14 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         }))
         setKeyFeedback({
           ok: true,
-          msg: `✓ Connected to ${res.model || "gemini-2.5-flash"}! Instant streaming ready.`,
+          msg: "Connected to Gemini 2.5 Flash",
         })
-        setStatusMessage(
-          "✓ Gemini 2.5 Flash Connected — Click Record and speak for instant transcription!",
-        )
-        setTimeout(() => setShowKeyModal(false), 700)
+        setStatusMessage("Gemini 2.5 Flash connected — ready to record")
+        setTimeout(() => setShowKeyEditor(false), 600)
       } else {
         setKeyFeedback({
           ok: false,
-          msg: res.error || "Invalid API Key — check your Google AI Studio key",
+          msg: res.error || "Invalid API Key",
         })
       }
     } catch (err) {
@@ -198,7 +295,6 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     }
   }
 
-  // Fires audio chunk immediately (non-blocking concurrent dispatch for instant response)
   const dispatchAudioChunk = useCallback(
     async (base64Data) => {
       if (!base64Data) return
@@ -223,7 +319,6 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
         if (res.turns && res.turns.length > 0) {
           playBlip("speaker")
-          // Clear interim preview for the phrase that just locked in
           setLivePreviewText("")
           setTurns((prev) => {
             const updated = [...prev]
@@ -245,14 +340,14 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
             .map((l) => l.name)
             .join(" + ")
           setStatusMessage(
-            `⚡ ${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
+            `${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
           )
         }
       } catch (err) {
         console.error("Transcription error:", err)
-        setStatusMessage(`⚠️ ${err.message}`)
+        setStatusMessage(`Error: ${err.message}`)
         if (err.message && err.message.toLowerCase().includes("api key")) {
-          setShowKeyModal(true)
+          setShowKeyEditor(true)
         }
       } finally {
         setInFlightCount((c) => Math.max(0, c - 1))
@@ -269,13 +364,10 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     return "en-IN"
   }, [selectedLangs])
 
-  // Click-to-Record / Click-to-Stop (now streams phrases LIVE while you talk!)
   const handleToggleRecord = useCallback(async () => {
     if (activeEngine === "gemini-cloud" && !isGeminiReady) {
-      setShowKeyModal(true)
-      setStatusMessage(
-        "Please paste your Gemini API Key first (or switch to Local Offline in the top bar).",
-      )
+      setShowKeyEditor(true)
+      setStatusMessage("Add your Gemini API key in the sidebar to begin")
       return
     }
 
@@ -284,13 +376,11 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       if (audioData && audioData.base64Data && audioData.durationSec >= 0.3) {
         dispatchAudioChunk(audioData.base64Data)
       } else {
-        setStatusMessage("Ready — Click Record to start speaking")
+        setStatusMessage("Ready to transcribe")
       }
     } else {
       playBlip("ping")
-      setStatusMessage(
-        "🔴 Live Streaming — Speak in Telugu, Hindi, or English (transcribes as you talk!)",
-      )
+      setStatusMessage("Listening — streaming phrases live")
       await startRecording({
         continuous: false,
         previewLang: getPreviewLang(),
@@ -311,13 +401,10 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     getPreviewLang,
   ])
 
-  // Continuous hands-free mode toggle
   const handleToggleContinuous = useCallback(async () => {
     if (activeEngine === "gemini-cloud" && !isGeminiReady) {
-      setShowKeyModal(true)
-      setStatusMessage(
-        "Please paste your Gemini API Key first (or switch to Local Offline in the top bar).",
-      )
+      setShowKeyEditor(true)
+      setStatusMessage("Add your Gemini API key in the sidebar to begin")
       return
     }
 
@@ -326,15 +413,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       if (leftover && leftover.base64Data && leftover.durationSec >= 0.3) {
         dispatchAudioChunk(leftover.base64Data)
       }
-      setStatusMessage("Auto-Listen paused.")
+      setStatusMessage("Auto-Listen paused")
     } else {
       if (isRecording) {
         await stopRecording()
       }
       playBlip("ping")
-      setStatusMessage(
-        "🟢 Auto-Listen ON — Speak naturally; transcribes live as you speak",
-      )
+      setStatusMessage("Auto-Listen active — hands-free streaming")
       await startRecording({
         continuous: true,
         previewLang: getPreviewLang(),
@@ -356,15 +441,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     getPreviewLang,
   ])
 
-  // Spacebar shortcut to toggle recording
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (
         e.target.tagName === "INPUT" ||
         e.target.tagName === "TEXTAREA" ||
         e.target.tagName === "SELECT" ||
-        editingSpeakerId ||
-        showKeyModal
+        editingSpeakerId
       ) {
         return
       }
@@ -375,7 +458,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     }
     window.addEventListener("keydown", handleKeyDown)
     return () => window.removeEventListener("keydown", handleKeyDown)
-  }, [editingSpeakerId, showKeyModal, handleToggleRecord])
+  }, [editingSpeakerId, handleToggleRecord])
 
   const handleSaveRename = async (spkId) => {
     if (!renameValue.trim()) {
@@ -409,16 +492,15 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       const audioData = await stopRecording()
       if (audioData && audioData.base64Data) {
         try {
-          setStatusMessage(
-            `Enrolling voiceprint for ${enrollingName.trim()}...`,
-          )
+          setStatusMessage(`Enrolling ${enrollingName.trim()}...`)
           const res = await enrollSpeakerAPI(
             enrollingName.trim(),
             audioData.base64Data,
           )
           if (res.speakers) setSpeakers(res.speakers)
-          setStatusMessage(`✓ Enrolled speaker "${enrollingName.trim()}"!`)
+          setStatusMessage(`Enrolled speaker "${enrollingName.trim()}"`)
           setEnrollingName("")
+          setShowEnrollInput(false)
         } catch (err) {
           setStatusMessage(`Enrollment failed: ${err.message}`)
         }
@@ -430,7 +512,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     try {
       await resetSpeakersAPI()
       setSpeakers([])
-      setStatusMessage("Speaker voiceprints reset for new session.")
+      setStatusMessage("Speaker voiceprints cleared")
     } catch (err) {
       console.error(err)
     }
@@ -441,7 +523,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     if (!file) return
     e.target.value = ""
     try {
-      setStatusMessage(`Decoding audio file "${file.name}"...`)
+      setStatusMessage(`Processing "${file.name}"...`)
       const decoded = await decodeAudioFileToBase64(file)
       if (decoded && decoded.base64Data) {
         dispatchAudioChunk(decoded.base64Data)
@@ -459,7 +541,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         const meaning =
           t.english_translation &&
           t.english_translation.toLowerCase() !== t.text.toLowerCase()
-            ? `\n  [English Meaning: ${t.english_translation}]`
+            ? `\n  [Meaning: ${t.english_translation}]`
             : ""
         return `[${t.timestamp || ""}] ${t.speaker_label} (${langs}): ${t.text}${meaning}`
       })
@@ -471,7 +553,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     navigator.clipboard.writeText(buildFullText())
     setCopiedId("all")
     setTimeout(() => setCopiedId(null), 1800)
-    setStatusMessage("✓ Copied full transcript to clipboard!")
+    setStatusMessage("Copied full transcript to clipboard")
   }
 
   const handleCopyTurn = (turn) => {
@@ -524,657 +606,654 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     selectedLangs.includes("hi")
 
   return (
-    <div className="studio-shell">
-      {/* Top Studio Header */}
-      <header className="studio-header">
-        <div className="studio-brand">
-          <span className="studio-logo-dot" />
-          <span className="studio-title">VOICE STUDIO</span>
-          <span className="studio-subtitle">
-            Instant Telugu · English · Hindi · Multi-Speaker
-          </span>
+    <div className="pro-studio-layout">
+      {/* Left Control Sidebar */}
+      <aside className="pro-sidebar">
+        <div className="pro-sidebar-brand">
+          <div className="pro-logo-mark">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+              <line x1="12" x2="12" y1="19" y2="22" />
+            </svg>
+          </div>
+          <div>
+            <div className="pro-brand-name">Voice Studio</div>
+            <div className="pro-brand-sub">Multilingual Diarizer</div>
+          </div>
         </div>
 
-        <div className="studio-toolbar-center">
-          {/* Engine Mode: Gemini 2.5 Flash Cloud vs Local Offline */}
-          <div
-            className="script-mode-group"
-            title="Switch between Gemini 2.5 Flash Cloud (95%+ accuracy on Telugu/Hindi/English code-switching) and Local Offline"
-          >
+        {/* Engine Section */}
+        <div className="pro-sidebar-section">
+          <div className="pro-section-header">
+            <span>Transcription Engine</span>
+            <span
+              className={`pro-status-dot ${
+                activeEngine === "gemini-cloud"
+                  ? isGeminiReady
+                    ? "online"
+                    : "warning"
+                  : "online"
+              }`}
+            />
+          </div>
+          <div className="pro-segmented">
             <button
-              className={`mode-pill ${activeEngine === "gemini-cloud" ? "active" : ""}`}
+              className={`pro-seg-btn ${activeEngine === "gemini-cloud" ? "active" : ""}`}
               onClick={() =>
                 setConfig((prev) => ({ ...prev, asrEngine: "gemini-cloud" }))
               }
             >
-              ⚡ Gemini 2.5 Flash (Instant)
+              Gemini 2.5 Flash
             </button>
             <button
-              className={`mode-pill ${activeEngine !== "gemini-cloud" ? "active" : ""}`}
+              className={`pro-seg-btn ${activeEngine !== "gemini-cloud" ? "active" : ""}`}
               onClick={() =>
                 setConfig((prev) => ({ ...prev, asrEngine: "gemma4-audio" }))
               }
             >
-              💻 Local Offline
+              Local Offline
             </button>
           </div>
 
-          {/* Script Output Mode: English Script (Romanized) vs Native Script */}
-          <div
-            className="script-mode-group"
-            title="Write Telugu & Hindi in English alphabet (Romanized) or Native script"
-          >
+          {activeEngine === "gemini-cloud" && (
+            <div className="pro-key-box">
+              <div className="pro-key-status-row">
+                <span className="pro-key-label">
+                  {isGeminiReady
+                    ? `API Key (${maskedServerKey || "Configured"})`
+                    : "API Key Required"}
+                </span>
+                <button
+                  type="button"
+                  className="pro-link-btn"
+                  onClick={() => setShowKeyEditor((v) => !v)}
+                >
+                  {showKeyEditor ? "Hide" : isGeminiReady ? "Change" : "Add Key"}
+                </button>
+              </div>
+
+              {(showKeyEditor || !isGeminiReady) && (
+                <form onSubmit={handleSaveGeminiKey} className="pro-key-form">
+                  <input
+                    type="password"
+                    className="pro-input"
+                    value={keyInput}
+                    onChange={(e) => setKeyInput(e.target.value)}
+                    placeholder="Paste AIzaSy... Gemini key"
+                  />
+                  <div className="pro-key-actions">
+                    <a
+                      href="https://aistudio.google.com/apikey"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="pro-ext-link"
+                    >
+                      Get free key ↗
+                    </a>
+                    <button
+                      type="submit"
+                      className="pro-btn-primary-sm"
+                      disabled={isTestingKey || !keyInput.trim()}
+                    >
+                      {isTestingKey ? "Verifying..." : "Connect"}
+                    </button>
+                  </div>
+                  {keyFeedback && (
+                    <div
+                      className={`pro-key-feedback ${
+                        keyFeedback.ok ? "ok" : "err"
+                      }`}
+                    >
+                      {keyFeedback.msg}
+                    </div>
+                  )}
+                </form>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Output Script Section */}
+        <div className="pro-sidebar-section">
+          <div className="pro-section-header">
+            <span>Output Script</span>
+          </div>
+          <div className="pro-segmented">
             <button
-              className={`mode-pill ${scriptMode === "roman" ? "active" : ""}`}
+              className={`pro-seg-btn ${scriptMode === "roman" ? "active" : ""}`}
               onClick={() => setScriptMode("roman")}
             >
-              Aa English Script
+              English Script (Aa)
             </button>
             <button
-              className={`mode-pill ${scriptMode === "native" ? "active" : ""}`}
+              className={`pro-seg-btn ${scriptMode === "native" ? "active" : ""}`}
               onClick={() => setScriptMode("native")}
             >
-              ఆ/अ Native Script
+              Native (ఆ / अ)
             </button>
           </div>
-
-          {/* View Mode: Speaker Feed vs Full Text Document */}
-          <div className="view-mode-group">
-            <button
-              className={`mode-pill ${viewMode === "feed" ? "active" : ""}`}
-              onClick={() => setViewMode("feed")}
-            >
-              💬 Speaker Feed
-            </button>
-            <button
-              className={`mode-pill ${viewMode === "document" ? "active" : ""}`}
-              onClick={() => setViewMode("document")}
-            >
-              📄 Full Text
-            </button>
+          <div className="pro-section-caption">
+            {scriptMode === "roman"
+              ? "Writes Telugu, Hindi & English using English alphabet (Tanglish / Hinglish)."
+              : "Writes Telugu in తెలుగు, Hindi in हिन्दी, and English in Latin."}
           </div>
         </div>
 
-        <div className="studio-actions">
-          <button
-            className="studio-action-btn"
-            style={{
-              borderColor: isGeminiReady ? "#10b981" : "#f59e0b",
-              color: isGeminiReady ? "#34d399" : "#fbbf24",
-            }}
-            onClick={() => setShowKeyModal((v) => !v)}
-            title="Configure Google Gemini API Key"
-          >
-            {isGeminiReady ? "🟢 Gemini Key" : "🔑 Set Gemini Key"}
-          </button>
-          <button
-            className="studio-action-btn"
-            onClick={handleCopyAll}
-            disabled={turns.length === 0}
-          >
-            {copiedId === "all" ? "✓ Copied!" : "📋 Copy All"}
-          </button>
-          <button
-            className="studio-action-btn"
-            onClick={handleExportTxt}
-            disabled={turns.length === 0}
-          >
-            ⬇ Export
-          </button>
-          <button
-            className="studio-action-btn danger"
-            onClick={() => setTurns([])}
-            disabled={turns.length === 0}
-          >
-            Clear
-          </button>
-          {onOpenSettings && (
+        {/* Active Languages Section */}
+        <div className="pro-sidebar-section">
+          <div className="pro-section-header">
+            <span>Spoken Languages</span>
+          </div>
+          <div className="pro-lang-grid">
             <button
-              className="studio-action-btn"
-              onClick={onOpenSettings}
-              title="Settings"
+              className={`pro-lang-option full ${isTriadActive ? "active" : ""}`}
+              onClick={() => setSelectedLangs(["te", "en", "hi"])}
             >
-              ⚙️
-            </button>
-          )}
-        </div>
-      </header>
-
-      {/* Inline Gemini API Key Setup Banner */}
-      {(showKeyModal || (activeEngine === "gemini-cloud" && !isGeminiReady)) && (
-        <div
-          style={{
-            background: "rgba(15, 23, 42, 0.96)",
-            borderBottom: "1px solid rgba(245, 158, 11, 0.45)",
-            padding: "12px 24px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "12px",
-            flexWrap: "wrap",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "10px",
-              flexWrap: "wrap",
-            }}
-          >
-            <span
-              style={{ fontSize: "13px", fontWeight: 700, color: "#fbbf24" }}
-            >
-              🔑 Google Gemini 2.5 Flash API Key:
-            </span>
-            <a
-              href="https://aistudio.google.com/apikey"
-              target="_blank"
-              rel="noreferrer"
-              style={{
-                fontSize: "12px",
-                color: "#60a5fa",
-                textDecoration: "underline",
-              }}
-            >
-              Get a free key at aistudio.google.com/apikey ↗
-            </a>
-            {maskedServerKey && (
-              <span style={{ fontSize: "12px", color: "#34d399" }}>
-                (Saved: {maskedServerKey})
+              <span className="pro-lang-dots">
+                <i style={{ background: "#10b981" }} />
+                <i style={{ background: "#6366f1" }} />
+                <i style={{ background: "#f59e0b" }} />
               </span>
-            )}
-          </div>
-
-          <form
-            onSubmit={handleSaveGeminiKey}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              flex: 1,
-              maxWidth: "520px",
-            }}
-          >
-            <input
-              type="password"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-              placeholder="Paste your AIzaSy... Gemini API Key here"
-              style={{
-                flex: 1,
-                background: "#0b1120",
-                border: "1px solid rgba(245, 158, 11, 0.5)",
-                color: "#f8fafc",
-                padding: "7px 12px",
-                borderRadius: "8px",
-                fontSize: "13px",
-                outline: "none",
-              }}
-            />
-            <button
-              type="submit"
-              disabled={isTestingKey || !keyInput.trim()}
-              style={{
-                background: "#f59e0b",
-                color: "#0b1120",
-                border: "none",
-                padding: "7px 16px",
-                borderRadius: "8px",
-                fontSize: "13px",
-                fontWeight: 700,
-                cursor: "pointer",
-                whiteSpace: "nowrap",
-              }}
-            >
-              {isTestingKey ? "Testing..." : "Save & Connect"}
+              <span>Auto-Switch (Telugu + English + Hindi)</span>
             </button>
-            {isGeminiReady && (
+            <button
+              className={`pro-lang-option ${
+                selectedLangs.length === 1 && selectedLangs[0] === "te"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() => setSelectedLangs(["te"])}
+            >
+              Telugu
+            </button>
+            <button
+              className={`pro-lang-option ${
+                selectedLangs.length === 1 && selectedLangs[0] === "en"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() => setSelectedLangs(["en"])}
+            >
+              English
+            </button>
+            <button
+              className={`pro-lang-option ${
+                selectedLangs.length === 1 && selectedLangs[0] === "hi"
+                  ? "active"
+                  : ""
+              }`}
+              onClick={() => setSelectedLangs(["hi"])}
+            >
+              Hindi
+            </button>
+          </div>
+        </div>
+
+        {/* Speakers Roster Section */}
+        <div className="pro-sidebar-section pro-speakers-section">
+          <div className="pro-section-header">
+            <span>Speakers ({speakers.length})</span>
+            <div style={{ display: "flex", gap: "8px" }}>
               <button
                 type="button"
-                onClick={() => setShowKeyModal(false)}
-                className="studio-action-btn"
+                className="pro-link-btn"
+                onClick={() => setShowEnrollInput((v) => !v)}
               >
-                Close
+                + Enroll
               </button>
-            )}
-          </form>
-
-          {keyFeedback && (
-            <div
-              style={{
-                width: "100%",
-                fontSize: "12.5px",
-                fontWeight: 600,
-                color: keyFeedback.ok ? "#34d399" : "#f87171",
-              }}
-            >
-              {keyFeedback.msg}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Speaker & Language Roster Bar */}
-      <div className="studio-roster-bar">
-        <div className="roster-left">
-          <span className="roster-label">LANGUAGES:</span>
-          <button
-            className={`mode-pill ${isTriadActive ? "active" : ""}`}
-            style={{ padding: "4px 10px", fontSize: "12px" }}
-            onClick={() => setSelectedLangs(["te", "en", "hi"])}
-          >
-            ★ Auto (TE + EN + HI)
-          </button>
-          <button
-            className={`mode-pill ${selectedLangs.length === 1 && selectedLangs[0] === "te" ? "active" : ""}`}
-            style={{ padding: "4px 10px", fontSize: "12px" }}
-            onClick={() => setSelectedLangs(["te"])}
-          >
-            Telugu
-          </button>
-          <button
-            className={`mode-pill ${selectedLangs.length === 1 && selectedLangs[0] === "en" ? "active" : ""}`}
-            style={{ padding: "4px 10px", fontSize: "12px" }}
-            onClick={() => setSelectedLangs(["en"])}
-          >
-            English
-          </button>
-          <button
-            className={`mode-pill ${selectedLangs.length === 1 && selectedLangs[0] === "hi" ? "active" : ""}`}
-            style={{ padding: "4px 10px", fontSize: "12px" }}
-            onClick={() => setSelectedLangs(["hi"])}
-          >
-            Hindi
-          </button>
-
-          <span className="roster-label" style={{ marginLeft: "10px" }}>
-            SPEAKERS ({speakers.length}):
-          </span>
-          {speakers.length === 0 ? (
-            <span className="roster-hint">
-              Auto-detects voices as you speak (click badge to rename)
-            </span>
-          ) : (
-            speakers.map((spk) =>
-              editingSpeakerId === spk.id ? (
-                <span key={spk.id} className="speaker-rename-inline">
-                  <input
-                    type="text"
-                    value={renameValue}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") handleSaveRename(spk.id)
-                      if (e.key === "Escape") setEditingSpeakerId(null)
-                    }}
-                    placeholder="Speaker name"
-                    autoFocus
-                  />
-                  <button onClick={() => handleSaveRename(spk.id)}>Save</button>
-                </span>
-              ) : (
+              {speakers.length > 0 && (
                 <button
-                  key={spk.id}
-                  className="speaker-pill"
-                  style={{ borderColor: spk.color }}
-                  onClick={() => {
-                    setEditingSpeakerId(spk.id)
-                    setRenameValue(spk.label)
-                  }}
-                  title="Click to rename speaker"
+                  type="button"
+                  className="pro-link-btn muted"
+                  onClick={handleResetSpeakers}
                 >
-                  <span
-                    className="speaker-dot"
-                    style={{ background: spk.color }}
-                  />
-                  <span>{spk.label}</span>
-                  <span className="speaker-edit-icon">✎</span>
+                  Reset
                 </button>
-              ),
-            )
-          )}
-        </div>
-
-        <div className="roster-right">
-          <div className="enroll-inline">
-            <input
-              type="text"
-              placeholder="Enroll name (e.g. Sandeep)"
-              value={enrollingName}
-              onChange={(e) => setEnrollingName(e.target.value)}
-            />
-            {enrollingName.trim() && (
-              <button
-                className={`enroll-btn ${isEnrollingRecord ? "recording" : ""}`}
-                onClick={handleEnrollToggle}
-              >
-                {isEnrollingRecord
-                  ? "⏹ Stop & Save Voice"
-                  : "🎙️ Record 3s Voice"}
-              </button>
-            )}
-          </div>
-          {speakers.length > 0 && (
-            <button className="reset-voices-btn" onClick={handleResetSpeakers}>
-              Reset Voices
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Main Transcript Area */}
-      <main className="studio-workspace">
-        {micError && (
-          <div
-            style={{
-              background: "rgba(239, 68, 68, 0.18)",
-              border: "1px solid #ef4444",
-              color: "#fca5a5",
-              padding: "10px 16px",
-              borderRadius: "10px",
-              marginBottom: "14px",
-              width: "100%",
-              maxWidth: "880px",
-            }}
-          >
-            ⚠️ Microphone Error: {micError}
-          </div>
-        )}
-
-        {turns.length === 0 && !isProcessing && !isRecording ? (
-          <div className="studio-empty-state">
-            <div className="empty-mic-circle">⚡</div>
-            <h2>Instant Multi-Speaker Voice Transcriber</h2>
-            <p>
-              Click <strong>Record</strong> below and start talking — phrases
-              stream <strong>live while you speak</strong> (every ~0.4s pause or
-              2.8s phrase) with{" "}
-              <strong>
-                {activeEngine === "gemini-cloud"
-                  ? "Gemini 2.5 Flash + Local 3D-Speaker"
-                  : "Local Gemma 4 + 3D-Speaker"}
-              </strong>
-              , written in{" "}
-              <strong>
-                {scriptMode === "roman"
-                  ? "English Script (Tanglish / Hinglish / English)"
-                  : "Native Script (తెలుగు / हिन्दी / English)"}
-              </strong>
-              .
-            </p>
-            <div className="empty-tips">
-              <span className="tip-badge">⚡ Live Streaming As You Speak</span>
-              <span className="tip-badge">
-                ✓ English Script for Telugu & Hindi
-              </span>
-              <span className="tip-badge">✓ Multi-Speaker Voiceprint ID</span>
-            </div>
-          </div>
-        ) : viewMode === "document" ? (
-          <div className="studio-document-container">
-            <div className="document-header">
-              <span>Full Conversation Transcript ({turns.length} turns)</span>
-              <button className="doc-copy-btn" onClick={handleCopyAll}>
-                {copiedId === "all" ? "✓ Copied!" : "📋 Copy Full Text"}
-              </button>
-            </div>
-            <div className="document-body">
-              {turns.map((turn, idx) => (
-                <div key={turn.id || idx} className="document-paragraph">
-                  <span
-                    className="doc-speaker"
-                    style={{ color: turn.speaker_color || "#f59e0b" }}
-                  >
-                    {turn.speaker_label}
-                  </span>
-                  <span className="doc-lang-tag">
-                    [{(turn.languages || []).map((l) => l.name).join(" + ")}]
-                  </span>
-                  <span className="doc-text">{turn.text}</span>
-                  {config.showEnglishMeaning !== false &&
-                    turn.english_translation &&
-                    turn.english_translation.toLowerCase() !==
-                      turn.text.toLowerCase() && (
-                      <span className="doc-meaning">
-                        {" "}
-                        — ({turn.english_translation})
-                      </span>
-                    )}
-                </div>
-              ))}
-              {isRecording && livePreviewText && (
-                <div
-                  className="document-paragraph"
-                  style={{ opacity: 0.75, color: "#fbbf24" }}
-                >
-                  <strong>[Live Speaking...]</strong> {livePreviewText}
-                </div>
               )}
             </div>
           </div>
-        ) : (
-          <div className="studio-feed-list">
-            {turns.map((turn, idx) => {
-              const spkColor = turn.speaker_color || "#f59e0b"
-              const hasMultiClauses = turn.clauses && turn.clauses.length > 1
-              const showMeaning =
-                config.showEnglishMeaning !== false &&
-                turn.english_translation &&
-                turn.english_translation.trim() !== "" &&
-                turn.english_translation.trim().toLowerCase() !==
-                  turn.text.trim().toLowerCase()
 
-              return (
-                <div
-                  key={turn.id || idx}
-                  className="studio-turn-card"
-                  style={{ borderLeftColor: spkColor }}
-                >
-                  <div className="turn-card-header">
-                    <span
-                      className="turn-speaker-tag"
+          {showEnrollInput && (
+            <div className="pro-enroll-box">
+              <input
+                type="text"
+                className="pro-input"
+                placeholder="Speaker name (e.g. Sandeep)"
+                value={enrollingName}
+                onChange={(e) => setEnrollingName(e.target.value)}
+              />
+              <button
+                type="button"
+                className={`pro-btn-primary-sm ${
+                  isEnrollingRecord ? "recording" : ""
+                }`}
+                disabled={!enrollingName.trim()}
+                onClick={handleEnrollToggle}
+              >
+                {isEnrollingRecord ? "Stop & Save Sample" : "Record 3s Voice"}
+              </button>
+            </div>
+          )}
+
+          <div className="pro-speaker-list">
+            {speakers.length === 0 ? (
+              <div className="pro-empty-speakers">
+                Voices are automatically fingerprinted and grouped as you speak.
+              </div>
+            ) : (
+              speakers.map((spk) =>
+                editingSpeakerId === spk.id ? (
+                  <div key={spk.id} className="pro-speaker-edit-row">
+                    <input
+                      type="text"
+                      className="pro-input"
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleSaveRename(spk.id)
+                        if (e.key === "Escape") setEditingSpeakerId(null)
+                      }}
+                      autoFocus
+                    />
+                    <button
+                      className="pro-btn-primary-sm"
+                      onClick={() => handleSaveRename(spk.id)}
+                    >
+                      Save
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    key={spk.id}
+                    className="pro-speaker-item"
+                    onClick={() => {
+                      setEditingSpeakerId(spk.id)
+                      setRenameValue(spk.label)
+                    }}
+                    title="Click to rename speaker"
+                  >
+                    <div
+                      className="pro-speaker-avatar"
                       style={{
-                        background: `${spkColor}24`,
+                        background: `${spk.color}20`,
+                        color: spk.color,
+                        borderColor: `${spk.color}55`,
+                      }}
+                    >
+                      {getInitials(spk.label)}
+                    </div>
+                    <div className="pro-speaker-info">
+                      <div className="pro-speaker-name">{spk.label}</div>
+                      <div className="pro-speaker-meta">
+                        {spk.utterance_count || 1} turns · {spk.total_seconds}s
+                      </div>
+                    </div>
+                    <span className="pro-speaker-rename-hint">Rename</span>
+                  </div>
+                ),
+              )
+            )}
+          </div>
+        </div>
+
+        {onOpenSettings && (
+          <div className="pro-sidebar-footer">
+            <button className="pro-settings-btn" onClick={onOpenSettings}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+              </svg>
+              <span>Advanced Settings</span>
+            </button>
+          </div>
+        )}
+      </aside>
+
+      {/* Main Content Stage */}
+      <div className="pro-main-stage">
+        {/* Top Bar */}
+        <header className="pro-topbar">
+          <div className="pro-topbar-left">
+            <div className="pro-view-switcher">
+              <button
+                className={`pro-view-tab ${viewMode === "feed" ? "active" : ""}`}
+                onClick={() => setViewMode("feed")}
+              >
+                Conversation Feed
+              </button>
+              <button
+                className={`pro-view-tab ${
+                  viewMode === "document" ? "active" : ""
+                }`}
+                onClick={() => setViewMode("document")}
+              >
+                Document View
+              </button>
+            </div>
+            <span className="pro-session-counter">
+              {turns.length} {turns.length === 1 ? "turn" : "turns"}
+            </span>
+          </div>
+
+          <div className="pro-topbar-actions">
+            <button
+              className="pro-Button-ghost"
+              onClick={handleCopyAll}
+              disabled={turns.length === 0}
+            >
+              {copiedId === "all" ? "Copied" : "Copy All"}
+            </button>
+            <button
+              className="pro-Button-ghost"
+              onClick={handleExportTxt}
+              disabled={turns.length === 0}
+            >
+              Export .txt
+            </button>
+            <button
+              className="pro-Button-ghost danger"
+              onClick={() => setTurns([])}
+              disabled={turns.length === 0}
+            >
+              Clear
+            </button>
+          </div>
+        </header>
+
+        {/* Workspace Scroll Area */}
+        <main className="pro-canvas">
+          {micError && (
+            <div className="pro-alert-error">
+              Microphone Error: {micError}
+            </div>
+          )}
+
+          {turns.length === 0 && !isProcessing && !isRecording ? (
+            <div className="pro-empty-hero">
+              <div className="pro-empty-icon">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" x2="12" y1="19" y2="22" />
+                </svg>
+              </div>
+              <h2>Start speaking in Telugu, English, or Hindi</h2>
+              <p>
+                Switch languages mid-sentence without changing any settings.
+                Phrases stream live as you speak, automatically identifying each
+                speaker and writing in{" "}
+                <strong>
+                  {scriptMode === "roman"
+                    ? "English Script (Romanized)"
+                    : "Native Script"}
+                </strong>
+                .
+              </p>
+              <div className="pro-feature-pills">
+                <span>Live Phrase Streaming</span>
+                <span>3D-Speaker Voiceprints</span>
+                <span>Mid-Sentence Code-Switching</span>
+              </div>
+            </div>
+          ) : viewMode === "document" ? (
+            <div className="pro-doc-sheet">
+              <div className="pro-doc-header">
+                <span>Transcript Document</span>
+                <button className="pro-btn-primary-sm" onClick={handleCopyAll}>
+                  {copiedId === "all" ? "Copied" : "Copy Text"}
+                </button>
+              </div>
+              <div className="pro-doc-content">
+                {turns.map((turn, idx) => (
+                  <div key={turn.id || idx} className="pro-doc-block">
+                    <div className="pro-doc-meta">
+                      <span
+                        className="pro-doc-speaker"
+                        style={{ color: turn.speaker_color || "#818cf8" }}
+                      >
+                        {turn.speaker_label}
+                      </span>
+                      <span className="pro-doc-langs">
+                        {(turn.languages || []).map((l) => l.name).join(" / ")}
+                      </span>
+                      <span className="pro-doc-time">{turn.timestamp}</span>
+                    </div>
+                    <div className="pro-doc-text">{turn.text}</div>
+                    {config.showEnglishMeaning !== false &&
+                      turn.english_translation &&
+                      turn.english_translation.toLowerCase() !==
+                        turn.text.toLowerCase() && (
+                        <div className="pro-doc-translation">
+                          {turn.english_translation}
+                        </div>
+                      )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="pro-feed-stream">
+              {turns.map((turn, idx) => {
+                const spkColor = turn.speaker_color || "#6366f1"
+                const hasMultiClauses = turn.clauses && turn.clauses.length > 1
+                const showMeaning =
+                  config.showEnglishMeaning !== false &&
+                  turn.english_translation &&
+                  turn.english_translation.trim() !== "" &&
+                  turn.english_translation.trim().toLowerCase() !==
+                    turn.text.trim().toLowerCase()
+
+                return (
+                  <article key={turn.id || idx} className="pro-turn-row">
+                    <div
+                      className="pro-turn-avatar"
+                      style={{
+                        background: `${spkColor}18`,
                         color: spkColor,
-                        border: `1px solid ${spkColor}66`,
+                        borderColor: `${spkColor}45`,
                       }}
                       onClick={() => {
                         setEditingSpeakerId(turn.speaker_id)
                         setRenameValue(turn.speaker_label)
                       }}
-                      title="Click to rename speaker"
+                      title="Click to rename speaker in sidebar"
                     >
-                      👤 {turn.speaker_label} ✎
-                    </span>
+                      {getInitials(turn.speaker_label)}
+                    </div>
 
-                    <div className="turn-meta-badges">
-                      {turn.language_switched && (
-                        <span className="turn-switch-pill">
-                          ⚡ Switched Languages
+                    <div className="pro-turn-body">
+                      <div className="pro-turn-meta">
+                        <span
+                          className="pro-turn-speaker"
+                          onClick={() => {
+                            setEditingSpeakerId(turn.speaker_id)
+                            setRenameValue(turn.speaker_label)
+                          }}
+                        >
+                          {turn.speaker_label}
                         </span>
+
+                        {(turn.languages || []).map((l, i) => {
+                          const st = getLangStyle(l.code)
+                          return (
+                            <span
+                              key={l.code + i}
+                              className="pro-lang-badge"
+                              style={{
+                                background: st.bg,
+                                color: st.text,
+                                borderColor: st.border,
+                              }}
+                            >
+                              {l.name}
+                            </span>
+                          )
+                        })}
+
+                        {turn.language_switched && (
+                          <span className="pro-switch-tag">Code-Switched</span>
+                        )}
+
+                        <span className="pro-turn-timestamp">
+                          {turn.timestamp}
+                        </span>
+
+                        <div className="pro-turn-actions">
+                          <button
+                            className="pro-icon-btn"
+                            onClick={() => handleCopyTurn(turn)}
+                            title="Copy utterance"
+                          >
+                            {copiedId === turn.id ? "Copied" : "Copy"}
+                          </button>
+                          <button
+                            className="pro-icon-btn"
+                            onClick={() => handleSpeakTurn(turn)}
+                            title="Read aloud"
+                          >
+                            Listen
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="pro-turn-transcript">
+                        {hasMultiClauses ? (
+                          turn.clauses.map((c, cIdx) => {
+                            const st = getLangStyle(c.lang)
+                            return (
+                              <span
+                                key={cIdx}
+                                className="pro-clause-span"
+                                style={{ borderBottomColor: st.dot }}
+                                title={c.lang_name || c.lang}
+                              >
+                                {c.text}
+                                {cIdx < turn.clauses.length - 1 ? " " : ""}
+                              </span>
+                            )
+                          })
+                        ) : (
+                          <span>{turn.text}</span>
+                        )}
+                      </div>
+
+                      {showMeaning && (
+                        <div className="pro-turn-translation">
+                          <span className="pro-translation-label">
+                            English
+                          </span>
+                          <span>{turn.english_translation}</span>
+                        </div>
                       )}
-                      {(turn.languages || []).map((l, i) => {
-                        const st = getLangStyle(l.code)
-                        return (
-                          <span
-                            key={l.code + i}
-                            className="turn-lang-pill"
-                            style={{
-                              background: st.bg,
-                              color: st.text,
-                              border: `1px solid ${st.border}`,
-                            }}
-                          >
-                            {l.name}
-                          </span>
-                        )
-                      })}
-                      <span className="turn-time">{turn.timestamp}</span>
-                      <button
-                        className="turn-copy-btn"
-                        onClick={() => handleCopyTurn(turn)}
-                        title="Copy text"
-                      >
-                        {copiedId === turn.id ? "✓" : "📋"}
-                      </button>
-                      <button
-                        className="turn-copy-btn"
-                        onClick={() => handleSpeakTurn(turn)}
-                        title="Listen"
-                      >
-                        🔊
-                      </button>
+                    </div>
+                  </article>
+                )
+              })}
+
+              {/* Live Speaking Stream Row */}
+              {isRecording && (
+                <div className="pro-turn-row live-row">
+                  <div className="pro-turn-avatar live-avatar">
+                    <span className="pro-live-pulse" />
+                  </div>
+                  <div className="pro-turn-body">
+                    <div className="pro-turn-meta">
+                      <span className="pro-live-badge">Live Microphone</span>
+                      <span className="pro-turn-timestamp">
+                        {formatTimer(recordingSeconds)}
+                      </span>
+                    </div>
+                    <div className="pro-turn-transcript live-text">
+                      {livePreviewText || "Listening..."}
                     </div>
                   </div>
-
-                  <div className="turn-card-text">
-                    {hasMultiClauses ? (
-                      turn.clauses.map((c, cIdx) => {
-                        const st = getLangStyle(c.lang)
-                        return (
-                          <span
-                            key={cIdx}
-                            className="clause-inline"
-                            style={{ borderBottomColor: st.border }}
-                            title={c.lang_name || c.lang}
-                          >
-                            {c.text}
-                            {cIdx < turn.clauses.length - 1 ? " " : ""}
-                          </span>
-                        )
-                      })
-                    ) : (
-                      <span>{turn.text}</span>
-                    )}
-                  </div>
-
-                  {showMeaning && (
-                    <div className="turn-card-meaning">
-                      <span className="meaning-prefix">English Meaning:</span>{" "}
-                      {turn.english_translation}
-                    </div>
-                  )}
                 </div>
-              )
-            })}
+              )}
 
-            {/* Instant <100ms Live Speaking Card while user is talking */}
-            {isRecording && (
-              <div
-                className="studio-turn-card"
-                style={{
-                  borderLeftColor: "#ef4444",
-                  background: "rgba(30, 41, 59, 0.55)",
-                  borderStyle: "dashed",
-                }}
+              {isProcessing && (
+                <div className="pro-processing-bar">
+                  <span className="pro-spinner" />
+                  <span>
+                    Diarizing speaker & transcribing phrase...
+                  </span>
+                </div>
+              )}
+
+              <div ref={feedEndRef} />
+            </div>
+          )}
+        </main>
+
+        {/* Floating Bottom Control Dock */}
+        <footer className="pro-dock-wrapper">
+          <div className="pro-dock">
+            <div className="pro-dock-left">
+              <StudioWaveform isRecording={isRecording} analyser={analyser} />
+              <span
+                className={`pro-dock-status ${isRecording ? "active" : ""}`}
               >
-                <div className="turn-card-header">
-                  <span
-                    className="turn-speaker-tag"
-                    style={{
-                      background: "rgba(239, 68, 68, 0.2)",
-                      color: "#fca5a5",
-                      border: "1px solid rgba(239, 68, 68, 0.5)",
-                    }}
-                  >
-                    🔴 LIVE SPEAKING...
-                  </span>
-                  <span className="turn-time">
-                    Streaming phrases every pause
-                  </span>
-                </div>
-                <div
-                  className="turn-card-text"
-                  style={{ color: "#e2e8f0", fontStyle: livePreviewText ? "normal" : "italic" }}
-                >
-                  {livePreviewText || "Listening to your voice..."}
-                </div>
-              </div>
-            )}
-          </div>
-        )}
+                {statusMessage}
+              </span>
+            </div>
 
-        {isProcessing && (
-          <div className="studio-processing-card">
-            <span className="processing-spinner" />
-            <span>
-              ⚡ Locking in speaker voiceprint & Telugu/Hindi/English
-              transcription...
-            </span>
-          </div>
-        )}
+            <div className="pro-dock-center">
+              <button
+                className={`pro-record-btn ${
+                  isRecording && !isContinuous ? "recording" : ""
+                }`}
+                onClick={handleToggleRecord}
+              >
+                {isRecording && !isContinuous ? (
+                  <>
+                    <span className="pro-stop-icon" />
+                    <span>Stop ({formatTimer(recordingSeconds)})</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="pro-mic-dot" />
+                    <span>Record</span>
+                    <kbd className="pro-kbd">Space</kbd>
+                  </>
+                )}
+              </button>
 
-        <div ref={feedEndRef} />
-      </main>
-
-      {/* Bottom Recording Dock */}
-      <footer className="studio-footer">
-        <div className="studio-waveform-row">
-          <div className="studio-waveform-wrap">
-            <Visualizer
-              activePerson={1}
-              isRecording={isRecording}
-              analyser={analyser}
-              barsCount={28}
-            />
-          </div>
-          <div
-            className={`studio-status-text ${isRecording ? "live" : ""}`}
-          >
-            {statusMessage}
-          </div>
-        </div>
-
-        <div className="studio-controls-dock">
-          {/* Primary Click-to-Record / Click-to-Stop Button */}
-          <button
-            className={`dock-btn primary-record ${
-              isRecording && !isContinuous ? "recording" : ""
-            }`}
-            onClick={handleToggleRecord}
-          >
-            {isRecording && !isContinuous ? (
-              <>
-                <span className="rec-stop-square" />
+              <button
+                className={`pro-secondary-dock-btn ${
+                  isContinuous ? "active" : ""
+                }`}
+                onClick={handleToggleContinuous}
+              >
+                <span
+                  className={`pro-auto-dot ${isContinuous ? "active" : ""}`}
+                />
                 <span>
-                  Stop Live Recording ({formatTimer(recordingSeconds)})
+                  {isContinuous
+                    ? `Auto-Listening (${formatTimer(recordingSeconds)})`
+                    : "Auto-Listen"}
                 </span>
-              </>
-            ) : (
-              <>
-                <span className="rec-dot" />
-                <span>Click to Record Live (Space)</span>
-              </>
-            )}
-          </button>
+              </button>
+            </div>
 
-          {/* Hands-Free Auto-Listen Toggle */}
-          <button
-            className={`dock-btn auto-listen ${isContinuous ? "active" : ""}`}
-            onClick={handleToggleContinuous}
-          >
-            {isContinuous
-              ? `🟢 Auto-Listening (${formatTimer(recordingSeconds)}) — Click to Stop`
-              : "🔄 Auto-Listen (Hands-Free)"}
-          </button>
-
-          {/* Upload Audio File */}
-          <button
-            className="dock-btn secondary"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={isRecording}
-          >
-            📁 Upload Audio
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            style={{ display: "none" }}
-            onChange={handleFileUpload}
-          />
-        </div>
-      </footer>
+            <div className="pro-dock-right">
+              <button
+                className="pro-upload-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isRecording}
+              >
+                Upload Audio
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="audio/*"
+                style={{ display: "none" }}
+                onChange={handleFileUpload}
+              />
+            </div>
+          </div>
+        </footer>
+      </div>
     </div>
   )
 }
