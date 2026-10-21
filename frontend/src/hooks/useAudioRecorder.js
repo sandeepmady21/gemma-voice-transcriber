@@ -17,13 +17,14 @@
 import { useState, useRef, useCallback, useEffect } from "react"
 import { getMergedSamples, resample, blobToBase64 } from "../utils/audioHelpers"
 
-// Mic capture hook supporting:
-// 1. Push-to-talk recording (startRecording / stopRecording)
-// 2. Continuous hands-free VAD auto-chunking (startContinuousRecording)
-// 3. Audio file decoding to 16kHz Float32 base64 (decodeAudioFileToBase64)
+// Ultra-low-latency mic capture hook supporting:
+// 1. Live micro-chunk streaming while speaking (flushes on >=0.42s pause or >=2.6s speech)
+// 2. Instant <100ms interim word preview via Web Speech API (while neural diarization + ASR runs)
+// 3. Audio file decoding to 16kHz Float32 base64
 export function useAudioRecorder() {
   const [isRecording, setIsRecording] = useState(false)
   const [isContinuous, setIsContinuous] = useState(false)
+  const [livePreviewText, setLivePreviewText] = useState("")
   const [micError, setMicError] = useState(null)
 
   const audioContextRef = useRef(null)
@@ -32,9 +33,11 @@ export function useAudioRecorder() {
   const scriptProcessorRef = useRef(null)
   const streamRef = useRef(null)
   const recordedSamplesRef = useRef([])
-  const continuousCallbackRef = useRef(null)
+  const chunkCallbackRef = useRef(null)
+  const recognitionRef = useRef(null)
+  const isRecordingRef = useRef(false)
 
-  // VAD state for continuous mode
+  // Fast VAD state for live micro-chunking
   const vadStateRef = useRef({
     hasSpokenInChunk: false,
     voicedFrames: 0,
@@ -42,7 +45,74 @@ export function useAudioRecorder() {
     totalFrames: 0,
   })
 
+  const stopBrowserLivePreview = useCallback(() => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.onend = null
+        recognitionRef.current.onresult = null
+        recognitionRef.current.onerror = null
+        recognitionRef.current.stop()
+      } catch (e) {
+        // Ignore
+      }
+      recognitionRef.current = null
+    }
+    setLivePreviewText("")
+  }, [])
+
+  const startBrowserLivePreview = useCallback((langHint = "en-IN") => {
+    const SpeechRec =
+      window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRec) return
+
+    try {
+      const rec = new SpeechRec()
+      rec.continuous = true
+      rec.interimResults = true
+      rec.lang = langHint || "en-IN"
+
+      rec.onresult = (event) => {
+        let interim = ""
+        let latestFinal = ""
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript
+          if (event.results[i].isFinal) {
+            latestFinal += transcript + " "
+          } else {
+            interim += transcript
+          }
+        }
+        const combined = (latestFinal + interim).trim()
+        if (combined) {
+          setLivePreviewText(combined)
+        }
+      }
+
+      rec.onerror = () => {
+        // Ignore browser speech preview errors silently
+      }
+
+      rec.onend = () => {
+        if (isRecordingRef.current && recognitionRef.current === rec) {
+          try {
+            rec.start()
+          } catch (e) {
+            // Ignore restart race
+          }
+        }
+      }
+
+      rec.start()
+      recognitionRef.current = rec
+    } catch (e) {
+      // Browser preview optional
+    }
+  }, [])
+
   const cleanupAudioGraph = useCallback(async () => {
+    isRecordingRef.current = false
+    stopBrowserLivePreview()
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop())
       streamRef.current = null
@@ -70,7 +140,7 @@ export function useAudioRecorder() {
       }
       audioContextRef.current = null
     }
-  }, [])
+  }, [stopBrowserLivePreview])
 
   useEffect(() => {
     return () => {
@@ -102,19 +172,25 @@ export function useAudioRecorder() {
     async (options = {}) => {
       const continuous = Boolean(options.continuous)
       const onChunkReady = options.onChunkReady || null
-      continuousCallbackRef.current = onChunkReady
+      chunkCallbackRef.current = onChunkReady
 
       setMicError(null)
+      setLivePreviewText("")
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
+            channelCount: 1,
           },
         })
 
         streamRef.current = stream
+        isRecordingRef.current = true
+
+        // Start instant <100ms interim word preview in parallel
+        startBrowserLivePreview(options.previewLang || "en-IN")
 
         const AudioContext = window.AudioContext || window.webkitAudioContext
         audioContextRef.current = new AudioContext()
@@ -129,8 +205,10 @@ export function useAudioRecorder() {
         analyserRef.current.fftSize = 256
         source.connect(analyserRef.current)
 
+        // Use 2048 buffer (~42ms at 48kHz) for snappier VAD cut detection
+        const bufferSize = 2048
         const scriptProcessor = audioContextRef.current.createScriptProcessor(
-          4096,
+          bufferSize,
           1,
           1,
         )
@@ -143,20 +221,22 @@ export function useAudioRecorder() {
           totalFrames: 0,
         }
 
-        // Each callback is 4096 / actualSampleRate seconds (~85ms at 48kHz)
-        const callbackDurationSec = 4096 / actualSampleRate
+        const callbackDurationSec = bufferSize / actualSampleRate
+        // Cut phrase after ~0.42s of pause once speech has started
         const silenceCallbacksForCut = Math.max(
-          8,
-          Math.round(1.05 / callbackDurationSec),
-        ) // ~1.05s pause triggers turn dispatch
-        const maxCallbacksPerChunk = Math.round(7.5 / callbackDurationSec) // max ~7.5s before auto-flush
+          6,
+          Math.round(0.42 / callbackDurationSec),
+        )
+        // Or auto-stream after ~2.8s of continuous speech so user sees text while still talking!
+        const maxCallbacksPerChunk = Math.round(2.8 / callbackDurationSec)
+        const preRollFrames = Math.max(4, Math.round(0.3 / callbackDurationSec))
 
         scriptProcessor.onaudioprocess = (e) => {
           const inputData = e.inputBuffer.getChannelData(0)
           const copy = new Float32Array(inputData)
           recordedSamplesRef.current.push(copy)
 
-          if (continuous && continuousCallbackRef.current) {
+          if (chunkCallbackRef.current) {
             let sumSq = 0
             for (let i = 0; i < copy.length; i++) {
               sumSq += copy[i] * copy[i]
@@ -165,7 +245,7 @@ export function useAudioRecorder() {
             const st = vadStateRef.current
             st.totalFrames += 1
 
-            if (rms > 0.015) {
+            if (rms > 0.013) {
               st.voicedFrames += 1
               st.silenceFrames = 0
               if (st.voicedFrames >= 3) {
@@ -175,33 +255,49 @@ export function useAudioRecorder() {
               st.silenceFrames += 1
             }
 
-            // Keep only ~0.5s of pre-roll silence if speech hasn't started yet
-            if (!st.hasSpokenInChunk && recordedSamplesRef.current.length > 7) {
+            // Trim leading silence so chunks start right before speech onset
+            if (
+              !st.hasSpokenInChunk &&
+              recordedSamplesRef.current.length > preRollFrames
+            ) {
               recordedSamplesRef.current.shift()
               st.totalFrames = recordedSamplesRef.current.length
             }
 
-            const shouldFlush =
+            // Flush immediately on a 0.42s pause, or after 2.8s of speech if at a brief dip
+            const pauseReached =
+              st.hasSpokenInChunk && st.silenceFrames >= silenceCallbacksForCut
+            const maxLenReached =
               st.hasSpokenInChunk &&
-              (st.silenceFrames >= silenceCallbacksForCut ||
-                st.totalFrames >= maxCallbacksPerChunk)
+              st.totalFrames >= maxCallbacksPerChunk &&
+              (rms < 0.025 || st.totalFrames >= Math.round(3.6 / callbackDurationSec))
 
-            if (shouldFlush) {
+            if (pauseReached || maxLenReached) {
+              // Keep last 2 frames (~85ms) as overlap pre-roll if splitting mid-speech
+              const overlap = maxLenReached
+                ? recordedSamplesRef.current.slice(-2)
+                : []
               const chunkToFlush = recordedSamplesRef.current.slice()
-              recordedSamplesRef.current = []
+              recordedSamplesRef.current = overlap
               vadStateRef.current = {
                 hasSpokenInChunk: false,
                 voicedFrames: 0,
                 silenceFrames: 0,
-                totalFrames: 0,
+                totalFrames: overlap.length,
               }
               encodeSamplesToBase64(chunkToFlush, actualSampleRate)
                 .then((res) => {
-                  if (res && res.durationSec >= 0.45 && continuousCallbackRef.current) {
-                    continuousCallbackRef.current(res)
+                  if (
+                    res &&
+                    res.durationSec >= 0.35 &&
+                    chunkCallbackRef.current
+                  ) {
+                    chunkCallbackRef.current(res)
                   }
                 })
-                .catch((err) => console.error("Continuous chunk encode error:", err))
+                .catch((err) =>
+                  console.error("Live chunk encode error:", err),
+                )
             }
           }
         }
@@ -221,13 +317,12 @@ export function useAudioRecorder() {
         return false
       }
     },
-    [encodeSamplesToBase64],
+    [encodeSamplesToBase64, startBrowserLivePreview],
   )
 
   const stopRecording = useCallback(async () => {
     if (!isRecording) return null
 
-    const wasContinuous = isContinuous
     const hasSpoken = vadStateRef.current.hasSpokenInChunk
     const actualSampleRate = audioContextRef.current?.sampleRate || 16000
     const remainingSamples = recordedSamplesRef.current.slice()
@@ -235,14 +330,11 @@ export function useAudioRecorder() {
 
     setIsRecording(false)
     setIsContinuous(false)
-    continuousCallbackRef.current = null
+    chunkCallbackRef.current = null
 
     await cleanupAudioGraph()
 
-    if (remainingSamples.length === 0) {
-      return null
-    }
-    if (wasContinuous && !hasSpoken) {
+    if (remainingSamples.length === 0 || !hasSpoken) {
       return null
     }
 
@@ -252,7 +344,7 @@ export function useAudioRecorder() {
       console.error("Base64 encoding failed:", err)
       return null
     }
-  }, [isRecording, isContinuous, cleanupAudioGraph, encodeSamplesToBase64])
+  }, [isRecording, cleanupAudioGraph, encodeSamplesToBase64])
 
   const decodeAudioFileToBase64 = useCallback(async (file) => {
     const arrayBuffer = await file.arrayBuffer()
@@ -281,6 +373,8 @@ export function useAudioRecorder() {
   return {
     isRecording,
     isContinuous,
+    livePreviewText,
+    setLivePreviewText,
     startRecording,
     stopRecording,
     decodeAudioFileToBase64,

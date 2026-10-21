@@ -49,6 +49,8 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   const {
     isRecording,
     isContinuous,
+    livePreviewText,
+    setLivePreviewText,
     startRecording,
     stopRecording,
     decodeAudioFileToBase64,
@@ -58,9 +60,9 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
   const [turns, setTurns] = useState([])
   const [speakers, setSpeakers] = useState([])
-  const [isProcessing, setIsProcessing] = useState(false)
+  const [inFlightCount, setInFlightCount] = useState(0)
   const [statusMessage, setStatusMessage] = useState(
-    "Ready — Click Record or Auto-Listen to transcribe Telugu, English & Hindi",
+    "Ready — Click Record or Auto-Listen for instant Telugu, English & Hindi transcription",
   )
 
   // "roman" = English script for Telugu, Hindi & English (default)
@@ -96,13 +98,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   const feedEndRef = useRef(null)
   const fileInputRef = useRef(null)
   const audioPlayerRef = useRef(null)
-  const chunkQueueRef = useRef([])
-  const isDrainingQueueRef = useRef(false)
 
   const activeEngine = config.asrEngine || "gemini-cloud"
   const isGeminiReady = Boolean(
     hasServerKey || (config.geminiApiKey && config.geminiApiKey.trim()),
   )
+  const isProcessing = inFlightCount > 0
 
   useEffect(() => {
     localStorage.setItem("transcriber_script_mode", scriptMode)
@@ -134,7 +135,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     if (feedEndRef.current && viewMode === "feed") {
       feedEndRef.current.scrollIntoView({ behavior: "smooth" })
     }
-  }, [turns, isProcessing, viewMode])
+  }, [turns, isProcessing, livePreviewText, viewMode])
 
   useEffect(() => {
     if (!isRecording) {
@@ -178,12 +179,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         }))
         setKeyFeedback({
           ok: true,
-          msg: `✓ Connected to ${res.model || "gemini-2.5-flash"}! Ready to transcribe.`,
+          msg: `✓ Connected to ${res.model || "gemini-2.5-flash"}! Instant streaming ready.`,
         })
         setStatusMessage(
-          "✓ Gemini 2.5 Flash Connected — Click Record to transcribe Telugu, English & Hindi!",
+          "✓ Gemini 2.5 Flash Connected — Click Record and speak for instant transcription!",
         )
-        setTimeout(() => setShowKeyModal(false), 900)
+        setTimeout(() => setShowKeyModal(false), 700)
       } else {
         setKeyFeedback({
           ok: false,
@@ -197,15 +198,11 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     }
   }
 
-  const processSingleChunk = useCallback(
+  // Fires audio chunk immediately (non-blocking concurrent dispatch for instant response)
+  const dispatchAudioChunk = useCallback(
     async (base64Data) => {
       if (!base64Data) return
-      setIsProcessing(true)
-      setStatusMessage(
-        activeEngine === "gemini-cloud"
-          ? "Transcribing with Gemini 2.5 Flash + 3D-Speaker voiceprint..."
-          : "Transcribing locally with Gemma 4 + 3D-Speaker...",
-      )
+      setInFlightCount((c) => c + 1)
 
       try {
         const res = await transcribeConversationChunk(base64Data, {
@@ -226,6 +223,8 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
         if (res.turns && res.turns.length > 0) {
           playBlip("speaker")
+          // Clear interim preview for the phrase that just locked in
+          setLivePreviewText("")
           setTurns((prev) => {
             const updated = [...prev]
             for (const newTurn of res.turns) {
@@ -246,13 +245,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
             .map((l) => l.name)
             .join(" + ")
           setStatusMessage(
-            `✓ ${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
-          )
-        } else {
-          setStatusMessage(
-            isContinuous
-              ? "Auto-Listen active — waiting for speech..."
-              : "No clear speech detected — speak closer to the mic",
+            `⚡ ${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
           )
         }
       } catch (err) {
@@ -262,35 +255,21 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           setShowKeyModal(true)
         }
       } finally {
-        setIsProcessing(false)
+        setInFlightCount((c) => Math.max(0, c - 1))
       }
     },
-    [config, activeEngine, selectedLangs, scriptMode, isContinuous],
+    [config, activeEngine, selectedLangs, scriptMode, setLivePreviewText],
   )
 
-  const drainQueue = useCallback(async () => {
-    if (isDrainingQueueRef.current) return
-    isDrainingQueueRef.current = true
-    try {
-      while (chunkQueueRef.current.length > 0) {
-        const nextBase64 = chunkQueueRef.current.shift()
-        await processSingleChunk(nextBase64)
-      }
-    } finally {
-      isDrainingQueueRef.current = false
+  const getPreviewLang = useCallback(() => {
+    if (selectedLangs.length === 1) {
+      if (selectedLangs[0] === "te") return "te-IN"
+      if (selectedLangs[0] === "hi") return "hi-IN"
     }
-  }, [processSingleChunk])
+    return "en-IN"
+  }, [selectedLangs])
 
-  const enqueueAudioChunk = useCallback(
-    (base64Data) => {
-      if (!base64Data) return
-      chunkQueueRef.current.push(base64Data)
-      drainQueue()
-    },
-    [drainQueue],
-  )
-
-  // Click-to-Record / Click-to-Stop toggle
+  // Click-to-Record / Click-to-Stop (now streams phrases LIVE while you talk!)
   const handleToggleRecord = useCallback(async () => {
     if (activeEngine === "gemini-cloud" && !isGeminiReady) {
       setShowKeyModal(true)
@@ -300,38 +279,36 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       return
     }
 
-    if (isContinuous) {
-      const leftover = await stopRecording()
-      if (leftover && leftover.base64Data && leftover.durationSec >= 0.4) {
-        enqueueAudioChunk(leftover.base64Data)
-      } else {
-        setStatusMessage("Stopped Auto-Listen.")
-      }
-      return
-    }
-
     if (isRecording) {
       const audioData = await stopRecording()
-      if (audioData && audioData.base64Data) {
-        enqueueAudioChunk(audioData.base64Data)
+      if (audioData && audioData.base64Data && audioData.durationSec >= 0.3) {
+        dispatchAudioChunk(audioData.base64Data)
       } else {
         setStatusMessage("Ready — Click Record to start speaking")
       }
     } else {
       playBlip("ping")
       setStatusMessage(
-        "Recording... Speak in Telugu, Hindi, or English, then click Stop & Transcribe",
+        "🔴 Live Streaming — Speak in Telugu, Hindi, or English (transcribes as you talk!)",
       )
-      await startRecording({ continuous: false })
+      await startRecording({
+        continuous: false,
+        previewLang: getPreviewLang(),
+        onChunkReady: (chunkObj) => {
+          if (chunkObj && chunkObj.base64Data) {
+            dispatchAudioChunk(chunkObj.base64Data)
+          }
+        },
+      })
     }
   }, [
     activeEngine,
     isGeminiReady,
     isRecording,
-    isContinuous,
     startRecording,
     stopRecording,
-    enqueueAudioChunk,
+    dispatchAudioChunk,
+    getPreviewLang,
   ])
 
   // Continuous hands-free mode toggle
@@ -346,8 +323,8 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
     if (isRecording && isContinuous) {
       const leftover = await stopRecording()
-      if (leftover && leftover.base64Data && leftover.durationSec >= 0.45) {
-        enqueueAudioChunk(leftover.base64Data)
+      if (leftover && leftover.base64Data && leftover.durationSec >= 0.3) {
+        dispatchAudioChunk(leftover.base64Data)
       }
       setStatusMessage("Auto-Listen paused.")
     } else {
@@ -356,13 +333,14 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       }
       playBlip("ping")
       setStatusMessage(
-        "Auto-Listen ON — Speak naturally; pauses automatically transcribe",
+        "🟢 Auto-Listen ON — Speak naturally; transcribes live as you speak",
       )
       await startRecording({
         continuous: true,
+        previewLang: getPreviewLang(),
         onChunkReady: (chunkObj) => {
           if (chunkObj && chunkObj.base64Data) {
-            enqueueAudioChunk(chunkObj.base64Data)
+            dispatchAudioChunk(chunkObj.base64Data)
           }
         },
       })
@@ -374,7 +352,8 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     isContinuous,
     startRecording,
     stopRecording,
-    enqueueAudioChunk,
+    dispatchAudioChunk,
+    getPreviewLang,
   ])
 
   // Spacebar shortcut to toggle recording
@@ -462,15 +441,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     if (!file) return
     e.target.value = ""
     try {
-      setIsProcessing(true)
       setStatusMessage(`Decoding audio file "${file.name}"...`)
       const decoded = await decodeAudioFileToBase64(file)
       if (decoded && decoded.base64Data) {
-        enqueueAudioChunk(decoded.base64Data)
+        dispatchAudioChunk(decoded.base64Data)
       }
     } catch (err) {
       setStatusMessage(`File error: ${err.message}`)
-      setIsProcessing(false)
     }
   }
 
@@ -554,7 +531,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           <span className="studio-logo-dot" />
           <span className="studio-title">VOICE STUDIO</span>
           <span className="studio-subtitle">
-            Telugu · English · Hindi · Multi-Speaker
+            Instant Telugu · English · Hindi · Multi-Speaker
           </span>
         </div>
 
@@ -570,7 +547,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                 setConfig((prev) => ({ ...prev, asrEngine: "gemini-cloud" }))
               }
             >
-              ☁️ Gemini 2.5 Flash (Best)
+              ⚡ Gemini 2.5 Flash (Instant)
             </button>
             <button
               className={`mode-pill ${activeEngine !== "gemini-cloud" ? "active" : ""}`}
@@ -677,8 +654,17 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
             flexWrap: "wrap",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
-            <span style={{ fontSize: "13px", fontWeight: 700, color: "#fbbf24" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "10px",
+              flexWrap: "wrap",
+            }}
+          >
+            <span
+              style={{ fontSize: "13px", fontWeight: 700, color: "#fbbf24" }}
+            >
               🔑 Google Gemini 2.5 Flash API Key:
             </span>
             <a
@@ -702,7 +688,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
           <form
             onSubmit={handleSaveGeminiKey}
-            style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, maxWidth: "520px" }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flex: 1,
+              maxWidth: "520px",
+            }}
           >
             <input
               type="password"
@@ -889,21 +881,20 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           </div>
         )}
 
-        {turns.length === 0 && !isProcessing ? (
+        {turns.length === 0 && !isProcessing && !isRecording ? (
           <div className="studio-empty-state">
-            <div className="empty-mic-circle">🎙️</div>
-            <h2>Ready to Transcribe Telugu, English & Hindi</h2>
+            <div className="empty-mic-circle">⚡</div>
+            <h2>Instant Multi-Speaker Voice Transcriber</h2>
             <p>
-              Powered by{" "}
+              Click <strong>Record</strong> below and start talking — phrases
+              stream <strong>live while you speak</strong> (every ~0.4s pause or
+              2.8s phrase) with{" "}
               <strong>
                 {activeEngine === "gemini-cloud"
-                  ? "Google Gemini 2.5 Flash Cloud Audio"
-                  : "Local Gemma 4 Audio"}
-              </strong>{" "}
-              + <strong>Local 3D-Speaker Voiceprints</strong>. Switch between{" "}
-              <strong>Telugu</strong>, <strong>English</strong>, and{" "}
-              <strong>Hindi</strong> mid-sentence — it identifies each speaker
-              and writes in{" "}
+                  ? "Gemini 2.5 Flash + Local 3D-Speaker"
+                  : "Local Gemma 4 + 3D-Speaker"}
+              </strong>
+              , written in{" "}
               <strong>
                 {scriptMode === "roman"
                   ? "English Script (Tanglish / Hinglish / English)"
@@ -912,11 +903,9 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
               .
             </p>
             <div className="empty-tips">
+              <span className="tip-badge">⚡ Live Streaming As You Speak</span>
               <span className="tip-badge">
-                ✓ 95%+ Accuracy on Telugu & Hindi
-              </span>
-              <span className="tip-badge">
-                ✓ English Script (Tanglish / Hinglish)
+                ✓ English Script for Telugu & Hindi
               </span>
               <span className="tip-badge">✓ Multi-Speaker Voiceprint ID</span>
             </div>
@@ -953,6 +942,14 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                     )}
                 </div>
               ))}
+              {isRecording && livePreviewText && (
+                <div
+                  className="document-paragraph"
+                  style={{ opacity: 0.75, color: "#fbbf24" }}
+                >
+                  <strong>[Live Speaking...]</strong> {livePreviewText}
+                </div>
+              )}
             </div>
           </div>
         ) : (
@@ -1060,6 +1057,40 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                 </div>
               )
             })}
+
+            {/* Instant <100ms Live Speaking Card while user is talking */}
+            {isRecording && (
+              <div
+                className="studio-turn-card"
+                style={{
+                  borderLeftColor: "#ef4444",
+                  background: "rgba(30, 41, 59, 0.55)",
+                  borderStyle: "dashed",
+                }}
+              >
+                <div className="turn-card-header">
+                  <span
+                    className="turn-speaker-tag"
+                    style={{
+                      background: "rgba(239, 68, 68, 0.2)",
+                      color: "#fca5a5",
+                      border: "1px solid rgba(239, 68, 68, 0.5)",
+                    }}
+                  >
+                    🔴 LIVE SPEAKING...
+                  </span>
+                  <span className="turn-time">
+                    Streaming phrases every pause
+                  </span>
+                </div>
+                <div
+                  className="turn-card-text"
+                  style={{ color: "#e2e8f0", fontStyle: livePreviewText ? "normal" : "italic" }}
+                >
+                  {livePreviewText || "Listening to your voice..."}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1067,9 +1098,8 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           <div className="studio-processing-card">
             <span className="processing-spinner" />
             <span>
-              {activeEngine === "gemini-cloud"
-                ? "Transcribing speech with Gemini 2.5 Flash + matching 3D-Speaker voiceprint..."
-                : "Transcribing speech locally with Gemma 4 + 3D-Speaker..."}
+              ⚡ Locking in speaker voiceprint & Telugu/Hindi/English
+              transcription...
             </span>
           </div>
         )}
@@ -1107,13 +1137,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
               <>
                 <span className="rec-stop-square" />
                 <span>
-                  Stop & Transcribe ({formatTimer(recordingSeconds)})
+                  Stop Live Recording ({formatTimer(recordingSeconds)})
                 </span>
               </>
             ) : (
               <>
                 <span className="rec-dot" />
-                <span>Click to Record (Space)</span>
+                <span>Click to Record Live (Space)</span>
               </>
             )}
           </button>
@@ -1132,7 +1162,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           <button
             className="dock-btn secondary"
             onClick={() => fileInputRef.current?.click()}
-            disabled={isRecording || isProcessing}
+            disabled={isRecording}
           >
             📁 Upload Audio
           </button>
