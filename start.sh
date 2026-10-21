@@ -82,9 +82,11 @@ if [ "$PROD_MODE" -eq 1 ] && [ ! -d "dist" ]; then
 fi
 cd "$PROJECT_DIR"
 
-# Set system volume to max
-echo "[start.sh] Setting system volume to max..."
-wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 || amixer sset Master 100% 2>/dev/null || true
+# Set system volume to max (Linux PipeWire/ALSA; no-op on macOS so user volume is preserved)
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "[start.sh] Setting system volume to max..."
+    wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 2>/dev/null || amixer sset Master 100% 2>/dev/null || true
+fi
 
 # Start litert-lm in background
 echo "[start.sh] Starting litert-lm..."
@@ -117,6 +119,7 @@ if [ "$PROD_MODE" -eq 1 ]; then
     echo "[start.sh] LiteRT-LM PID: $LITERT_PID"
     echo "[start.sh] API Server PID: $API_PID"
     echo "[start.sh] Access the UI at http://localhost:${API_PORT}"
+    WATCH_PIDS="$LITERT_PID $API_PID"
 else
     # Start web UI server
     echo "[start.sh] Starting Web UI on port ${WEB_PORT}..."
@@ -128,9 +131,16 @@ else
     echo "[start.sh] API Server PID: $API_PID"
     echo "[start.sh] Web UI PID: $WEB_PID"
     echo "[start.sh] Access the UI at http://localhost:${WEB_PORT}"
+    WATCH_PIDS="$LITERT_PID $API_PID $WEB_PID"
 fi
 
-# Wait for any child to exit (then the trap will clean up the others)
-wait -n
-echo "[start.sh] A child process exited. Shutting down."
-exit 1
+# Portable wait loop (compatible with macOS Bash 3.2 and Linux Bash 4+)
+while true; do
+    for pid in $WATCH_PIDS; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "[start.sh] Process $pid exited. Shutting down."
+            exit 1
+        fi
+    done
+    sleep 2
+done

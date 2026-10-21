@@ -15,23 +15,29 @@
  */
 
 import React, { useState, useEffect } from "react"
+import TranscriberApp from "./TranscriberApp"
 import TranslatorApp from "./TranslatorApp"
 import SettingsOverlay from "./components/SettingsOverlay"
 import { testConnectionAPI } from "./utils/api"
 
-// App shell: owns the global config (keyboardMode and themeColor persist in
-// localStorage), the settings overlay, and applies the theme by overriding
-// the --bg-black CSS variable.
 function App() {
-  // Global configuration
   const [config, setConfig] = useState({
+    appMode: localStorage.getItem("appMode") || "transcriber", // "transcriber" | "translator"
+    viewportMode: localStorage.getItem("viewportMode") || "desktop", // "desktop" | "kiosk"
+    asrEngine: localStorage.getItem("asrEngine") || "gemma4-audio", // "gemma4-audio" | "hybrid" | "whisper"
+    whisperModel: localStorage.getItem("whisperModel") || "small",
+    speakerThreshold: parseFloat(
+      localStorage.getItem("speakerThreshold") || "0.56",
+    ),
+    showEnglishMeaning:
+      localStorage.getItem("showEnglishMeaning") !== "false",
     endpointUrl: "http://localhost:9379/v1",
     modelName: "gemma4-e2b",
     apiKey: "",
     keyboardMode: localStorage.getItem("keyboardMode") || "landscape",
     useProxy: true,
     enableTts: true,
-    visualizerBars: 16,
+    visualizerBars: 32,
     systemPrompt: "Translator mode",
     themeColor: localStorage.getItem("themeColor") || "#ffa500",
   })
@@ -56,18 +62,55 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem("keyboardMode", config.keyboardMode)
-  }, [config.keyboardMode])
+    localStorage.setItem("appMode", config.appMode)
+    localStorage.setItem("viewportMode", config.viewportMode)
+    localStorage.setItem("asrEngine", config.asrEngine)
+    localStorage.setItem("whisperModel", config.whisperModel)
+    localStorage.setItem("speakerThreshold", String(config.speakerThreshold))
+    localStorage.setItem(
+      "showEnglishMeaning",
+      String(config.showEnglishMeaning),
+    )
+  }, [
+    config.keyboardMode,
+    config.appMode,
+    config.viewportMode,
+    config.asrEngine,
+    config.whisperModel,
+    config.speakerThreshold,
+    config.showEnglishMeaning,
+  ])
 
   useEffect(() => {
     if (config.themeColor) {
-      document.documentElement.style.setProperty('--bg-black', config.themeColor)
+      document.documentElement.style.setProperty(
+        "--bg-black",
+        config.themeColor,
+      )
       localStorage.setItem("themeColor", config.themeColor)
     }
   }, [config.themeColor])
 
+  const isKiosk = config.viewportMode === "kiosk"
+
   return (
-    <div className="app-container">
+    <div
+      className={`app-container ${isKiosk ? "kiosk-mode" : "desktop-mode"}`}
+    >
       <div className="config-wrap-right" style={{ opacity: 1 }}>
+        <button
+          className="config-toggle-btn"
+          onClick={() =>
+            setConfig((prev) => ({
+              ...prev,
+              viewportMode: prev.viewportMode === "kiosk" ? "desktop" : "kiosk",
+            }))
+          }
+          title="Toggle Desktop / 480x320 Kiosk Screen"
+          style={{ marginRight: "4px" }}
+        >
+          {isKiosk ? "🖥️ DESKTOP" : "📟 480×320"}
+        </button>
         <button
           className="config-toggle-btn"
           onClick={() => setIsSettingsOpen(true)}
@@ -77,8 +120,12 @@ function App() {
         </button>
       </div>
 
-      <div style={{ height: '100%' }}>
-        <TranslatorApp config={config} />
+      <div style={{ height: "100%", width: "100%" }}>
+        {config.appMode === "translator" ? (
+          <TranslatorApp config={config} />
+        ) : (
+          <TranscriberApp config={config} setConfig={setConfig} />
+        )}
       </div>
 
       <SettingsOverlay

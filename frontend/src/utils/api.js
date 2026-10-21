@@ -14,13 +14,10 @@
  * limitations under the License.
  */
 
-// API client for the Python backend (backend/server.py). LLM calls are
-// routed through the backend's /proxy by default so the kiosk stays
-// same-origin (no CORS) and works fully offline.
+// API client for the Python backend (backend/server.py).
 
-// Normalize a user-entered endpoint into an OpenAI-compatible ".../v1" base.
 export function getNormalizedBaseUrl(endpointUrl) {
-  let url = endpointUrl.trim()
+  let url = (endpointUrl || "").trim()
   if (!url) return "http://localhost:9379/v1"
   url = url.replace(/\/+$/, "")
   if (!url.endsWith("/v1")) {
@@ -29,7 +26,6 @@ export function getNormalizedBaseUrl(endpointUrl) {
   return url
 }
 
-// Cheap connectivity probe: GET {base}/v1/models.
 export async function testConnectionAPI(endpointUrl, useProxy, apiKey) {
   const baseUrl = getNormalizedBaseUrl(endpointUrl)
   const targetUrl = `${baseUrl}/models`
@@ -50,7 +46,86 @@ export async function testConnectionAPI(endpointUrl, useProxy, apiKey) {
   return true
 }
 
-// POST base64 Float32 PCM (16 kHz mono) to the local Moonshine STT.
+/**
+ * Calls POST /api/transcribe for multilingual code-switching ASR + speaker diarization.
+ */
+export async function transcribeConversationChunk(base64Data, options = {}) {
+  const response = await fetch("/api/transcribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      audio_base64: base64Data,
+      engine: options.engine || "gemma4-audio",
+      whisper_model: options.whisperModel || "small",
+      allowed_languages:
+        options.allowedLanguages && options.allowedLanguages.length > 0
+          ? options.allowedLanguages
+          : null,
+      speaker_threshold: options.speakerThreshold ?? 0.56,
+      endpoint_url: options.endpointUrl || "http://localhost:9379/v1",
+      model_name: options.modelName || "gemma4-e2b",
+    }),
+  })
+
+  if (!response.ok) {
+    const errText = await response.text()
+    throw new Error(`Transcription failed (${response.status}): ${errText}`)
+  }
+
+  return await response.json()
+}
+
+export async function fetchSpeakers() {
+  const res = await fetch("/api/speakers")
+  if (!res.ok) throw new Error("Failed to fetch speakers")
+  return await res.json()
+}
+
+export async function renameSpeakerAPI(speakerId, newLabel) {
+  const res = await fetch("/api/speakers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "rename",
+      speaker_id: speakerId,
+      label: newLabel,
+    }),
+  })
+  if (!res.ok) throw new Error("Failed to rename speaker")
+  return await res.json()
+}
+
+export async function enrollSpeakerAPI(label, base64Data) {
+  const res = await fetch("/api/speakers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "enroll",
+      label,
+      audio_base64: base64Data,
+    }),
+  })
+  if (!res.ok) throw new Error("Failed to enroll speaker")
+  return await res.json()
+}
+
+export async function resetSpeakersAPI() {
+  const res = await fetch("/api/speakers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "reset" }),
+  })
+  if (!res.ok) throw new Error("Failed to reset speakers")
+  return await res.json()
+}
+
+export async function fetchSupportedLanguages() {
+  const res = await fetch("/api/languages")
+  if (!res.ok) throw new Error("Failed to fetch languages")
+  return await res.json()
+}
+
+// Legacy Moonshine STT endpoint (used by 2-Lane Translator mode)
 export async function transcribeAudio(base64Data, sourceLangCode) {
   const response = await fetch("/api/stt", {
     method: "POST",
@@ -82,9 +157,6 @@ function generatePayloadJSON(transcribedText, model, systemPrompt) {
   return JSON.stringify({ model: model || "gemma4-e2b", messages })
 }
 
-// Chat-completions request. The system prompt demands a bare
-// {"translation": ...} JSON object; we still tolerate ``` fences and fall
-// back to the raw reply text if parsing fails.
 export async function translateText(transcribedText, config) {
   const { endpointUrl, useProxy, apiKey, modelName, systemPrompt } = config
   const baseUrl = getNormalizedBaseUrl(endpointUrl)
@@ -150,7 +222,6 @@ export async function translateText(transcribedText, config) {
   }
 }
 
-// Word-safe chunking so each /api/tts request stays under ~`limit` chars.
 export function splitTextIntoSpeechChunks(text, limit = 180) {
   const words = text.split(/\s+/)
   const chunks = []
@@ -166,4 +237,3 @@ export function splitTextIntoSpeechChunks(text, limit = 180) {
   if (currentChunk) chunks.push(currentChunk)
   return chunks
 }
-

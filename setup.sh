@@ -24,7 +24,8 @@ echo "Activating virtual environment..."
 source venv/bin/activate
 
 echo "Installing requirements..."
-pip install --require-hashes --extra-index-url https://pypi.org/simple/ -r backend/requirements.txt
+pip install --upgrade pip
+pip install --extra-index-url https://pypi.org/simple/ -r backend/requirements.txt
 
 echo "========================================="
 echo "Setup complete!"

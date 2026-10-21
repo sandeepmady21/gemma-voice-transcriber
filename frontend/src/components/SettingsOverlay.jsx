@@ -16,9 +16,6 @@
 
 import React from "react"
 
-// Fullscreen developer settings: theme color, LLM endpoint/model/key,
-// keyboard mode, TTS toggle, visualizer density, and system volume
-// (proxied to amixer on the Pi via the backend's /api/volume).
 export default function SettingsOverlay({
   isActive,
   onClose,
@@ -27,28 +24,28 @@ export default function SettingsOverlay({
   onTestConnection,
 }) {
   const THEME_COLORS = [
-    { name: "RED", value: "#ff4444" },
-    { name: "WHITE", value: "#ffffff" },
-    { name: "YELLOW", value: "#ffeb3b" },
-    { name: "BLUE", value: "#2196f3" },
-    { name: "GREEN", value: "#4caf50" },
     { name: "ORANGE", value: "#ffa500" },
-  ];
+    { name: "GREEN", value: "#4caf50" },
+    { name: "YELLOW", value: "#ffeb3b" },
+    { name: "WHITE", value: "#ffffff" },
+    { name: "BLUE", value: "#38bdf8" },
+    { name: "RED", value: "#ff5252" },
+  ]
 
-  const [systemVolume, setSystemVolume] = React.useState(null);
+  const [systemVolume, setSystemVolume] = React.useState(null)
 
   React.useEffect(() => {
     if (isActive) {
-      fetch('/api/volume')
+      fetch("/api/volume")
         .then((res) => res.json())
         .then((data) => {
           if (data.volume !== undefined && data.volume !== null) {
-            setSystemVolume(data.volume);
+            setSystemVolume(data.volume)
           }
         })
-        .catch((e) => console.error("Failed to fetch volume", e));
+        .catch((e) => console.error("Failed to fetch volume", e))
     }
-  }, [isActive]);
+  }, [isActive])
 
   if (!isActive) return null
 
@@ -58,17 +55,17 @@ export default function SettingsOverlay({
 
   const handleVolumeChange = async (action) => {
     try {
-      const res = await fetch('/api/volume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action })
-      });
-      const data = await res.json();
+      const res = await fetch("/api/volume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      })
+      const data = await res.json()
       if (data.volume !== undefined && data.volume !== null) {
-        setSystemVolume(data.volume);
+        setSystemVolume(data.volume)
       }
     } catch (e) {
-      console.error('Failed to change volume:', e);
+      console.error("Failed to change volume:", e)
     }
   }
 
@@ -78,29 +75,123 @@ export default function SettingsOverlay({
       style={{ display: isActive ? "flex" : "none" }}
     >
       <header className="overlay-header">
-        <h2>Developer Settings</h2>
+        <h2>System & AI Engine Settings</h2>
         <button className="overlay-close-btn" onClick={onClose}>
           ✕
         </button>
       </header>
       <div className="overlay-body">
-        <div className="form-group" style={{ marginBottom: "10px" }}>
+        <div className="form-group">
+          <label>Application Mode</label>
+          <select
+            value={config.appMode || "transcriber"}
+            onChange={(e) => handleChange("appMode", e.target.value)}
+          >
+            <option value="transcriber">
+              Multi-Speaker & Code-Switch Transcriber (Telugu / English / Hindi
+              + 99 Langs)
+            </option>
+            <option value="translator">
+              Classic 2-Lane Voice Translator Kiosk
+            </option>
+          </select>
+        </div>
+
+        <div className="form-group">
+          <label>ASR & Code-Switching Engine</label>
+          <select
+            value={config.asrEngine || "gemma4-audio"}
+            onChange={(e) => handleChange("asrEngine", e.target.value)}
+          >
+            <option value="gemma4-audio">
+              Gemma 4 E2B Multimodal Audio + 3D-Speaker Diarizer (Best for
+              mid-sentence TE/HI/EN switching)
+            </option>
+            <option value="hybrid">
+              Hybrid (Faster-Whisper + Gemma 4 Audio Disambiguation +
+              3D-Speaker)
+            </option>
+            <option value="whisper">
+              Faster-Whisper 99-Lang + 3D-Speaker Diarizer (Fastest CPU mode)
+            </option>
+          </select>
+        </div>
+
+        {config.asrEngine !== "gemma4-audio" && (
+          <div className="form-group">
+            <label>Whisper Model Size</label>
+            <select
+              value={config.whisperModel || "small"}
+              onChange={(e) => handleChange("whisperModel", e.target.value)}
+            >
+              <option value="small">
+                small (Recommended balance of speed & Indian script accuracy)
+              </option>
+              <option value="base">base (Ultra-lightweight)</option>
+              <option value="large-v3-turbo">
+                large-v3-turbo (Highest accuracy, ~1.6GB download on first use)
+              </option>
+            </select>
+          </div>
+        )}
+
+        <div className="form-group">
+          <label>
+            Speaker Voiceprint Threshold:{" "}
+            <span>{config.speakerThreshold ?? 0.56}</span> (Lower = stricter,
+            Higher = splits new speakers more easily)
+          </label>
+          <input
+            type="range"
+            min="0.40"
+            max="0.76"
+            step="0.02"
+            value={config.speakerThreshold ?? 0.56}
+            onChange={(e) =>
+              handleChange("speakerThreshold", parseFloat(e.target.value))
+            }
+          />
+        </div>
+
+        <div className="form-row-checkboxes">
+          <label className="checkbox-container">
+            <input
+              type="checkbox"
+              checked={config.showEnglishMeaning !== false}
+              onChange={(e) =>
+                handleChange("showEnglishMeaning", e.target.checked)
+              }
+            />
+            <span className="checkbox-label">
+              Show English Meaning Subtitle under Telugu / Hindi / Code-Switched
+              Turns
+            </span>
+          </label>
+        </div>
+
+        <div className="form-group" style={{ marginBottom: "6px" }}>
           <label>System Volume</label>
           <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
             <button
               className="overlay-btn"
               style={{ flex: 1 }}
-              onClick={() => handleVolumeChange('down')}
+              onClick={() => handleVolumeChange("down")}
             >
               -
             </button>
-            <span style={{ minWidth: "40px", textAlign: "center", fontWeight: "bold" }}>
+            <span
+              style={{
+                minWidth: "40px",
+                textAlign: "center",
+                fontWeight: "bold",
+              }}
+            >
               {systemVolume !== null ? `${systemVolume}%` : "--"}
             </span>
             <button
               className="overlay-btn"
               style={{ flex: 1 }}
-              onClick={() => handleVolumeChange('up')}
+              onClick={() => handleVolumeChange("up")}
             >
               +
             </button>
@@ -109,21 +200,25 @@ export default function SettingsOverlay({
 
         <div className="form-group">
           <label>Theme Color</label>
-          <div style={{ display: 'flex', gap: '10px', marginTop: '5px' }}>
+          <div style={{ display: "flex", gap: "10px", marginTop: "5px" }}>
             {THEME_COLORS.map((c) => (
               <button
                 key={c.name}
                 onClick={() => handleChange("themeColor", c.value)}
                 title={c.name}
                 style={{
-                  width: '30px',
-                  height: '30px',
-                  borderRadius: '50%',
+                  width: "30px",
+                  height: "30px",
+                  borderRadius: "50%",
                   backgroundColor: c.value,
-                  border: config.themeColor === c.value ? '2px solid #000' : '2px solid transparent',
-                  boxShadow: config.themeColor === c.value ? '0 0 0 2px #fff' : 'none',
-                  cursor: 'pointer',
-                  padding: 0
+                  border:
+                    config.themeColor === c.value
+                      ? "2px solid #000"
+                      : "2px solid transparent",
+                  boxShadow:
+                    config.themeColor === c.value ? "0 0 0 2px #fff" : "none",
+                  cursor: "pointer",
+                  padding: 0,
                 }}
               />
             ))}
@@ -131,7 +226,7 @@ export default function SettingsOverlay({
         </div>
 
         <div className="form-group">
-          <label>API Endpoint</label>
+          <label>LiteRT-LM / Local LLM Endpoint</label>
           <div className="input-inline">
             <input
               type="text"
@@ -159,58 +254,15 @@ export default function SettingsOverlay({
         </div>
 
         <div className="form-group">
-          <label>API Key</label>
+          <label>Visualizer Bars: {config.visualizerBars}</label>
           <input
-            type="password"
-            placeholder="Optional api key"
-            value={config.apiKey}
-            onChange={(e) => handleChange("apiKey", e.target.value)}
+            type="range"
+            min="8"
+            max="64"
+            step="8"
+            value={config.visualizerBars}
+            onChange={(e) => handleChange("visualizerBars", e.target.value)}
           />
-        </div>
-
-        <div className="form-group">
-          <label>Keyboard Mode</label>
-          <select
-            value={config.keyboardMode}
-            onChange={(e) => handleChange("keyboardMode", e.target.value)}
-          >
-            <option value="landscape">
-              Landscape — active person (Space / Z / ← →)
-            </option>
-            <option value="vertical">
-              Vertical — two-hand (Z / X / ← → / − +)
-            </option>
-          </select>
-        </div>
-
-        <div className="form-row-checkboxes">
-          <label className="checkbox-container">
-            <input
-              type="checkbox"
-              checked={config.enableTts}
-              onChange={(e) => handleChange("enableTts", e.target.checked)}
-            />
-            <span className="checkbox-label">Enable Speech Output</span>
-          </label>
-        </div>
-
-        <div className="form-group">
-          <label>Visualizer</label>
-          <div className="slider-row">
-            <div className="slider-group">
-              <label>
-                Bars: <span>{config.visualizerBars}</span>
-              </label>
-              <input
-                type="range"
-                min="8"
-                max="128"
-                step="8"
-                value={config.visualizerBars}
-                onChange={(e) => handleChange("visualizerBars", e.target.value)}
-              />
-            </div>
-          </div>
         </div>
       </div>
     </div>
