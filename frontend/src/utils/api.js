@@ -61,9 +61,10 @@ export async function transcribeConversationChunk(base64Data, options = {}) {
         options.allowedLanguages && options.allowedLanguages.length > 0
           ? options.allowedLanguages
           : null,
-      speaker_threshold: options.speakerThreshold ?? 0.56,
+      speaker_threshold: options.speakerThreshold ?? 0.45,
       endpoint_url: options.endpointUrl || "http://localhost:9379/v1",
       model_name: options.modelName || "gemma4-e2b",
+      script_mode: options.scriptMode || "roman",
     }),
   })
 

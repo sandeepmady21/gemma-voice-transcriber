@@ -27,7 +27,7 @@ function App() {
     asrEngine: localStorage.getItem("asrEngine") || "gemma4-audio", // "gemma4-audio" | "hybrid" | "whisper"
     whisperModel: localStorage.getItem("whisperModel") || "small",
     speakerThreshold: parseFloat(
-      localStorage.getItem("speakerThreshold") || "0.56",
+      localStorage.getItem("speakerThreshold") || "0.52",
     ),
     showEnglishMeaning:
       localStorage.getItem("showEnglishMeaning") !== "false",
@@ -92,39 +92,49 @@ function App() {
   }, [config.themeColor])
 
   const isKiosk = config.viewportMode === "kiosk"
+  const isTranscriber = config.appMode !== "translator"
 
   return (
     <div
-      className={`app-container ${isKiosk ? "kiosk-mode" : "desktop-mode"}`}
+      className={`app-container ${isKiosk ? "kiosk-mode" : "desktop-mode"} ${
+        isTranscriber ? "studio-mode-container" : ""
+      }`}
     >
-      <div className="config-wrap-right" style={{ opacity: 1 }}>
-        <button
-          className="config-toggle-btn"
-          onClick={() =>
-            setConfig((prev) => ({
-              ...prev,
-              viewportMode: prev.viewportMode === "kiosk" ? "desktop" : "kiosk",
-            }))
-          }
-          title="Toggle Desktop / 480x320 Kiosk Screen"
-          style={{ marginRight: "4px" }}
-        >
-          {isKiosk ? "🖥️ DESKTOP" : "📟 480×320"}
-        </button>
-        <button
-          className="config-toggle-btn"
-          onClick={() => setIsSettingsOpen(true)}
-          title="Settings"
-        >
-          ⚙️
-        </button>
-      </div>
+      {!isTranscriber && (
+        <div className="config-wrap-right" style={{ opacity: 1 }}>
+          <button
+            className="config-toggle-btn"
+            onClick={() =>
+              setConfig((prev) => ({
+                ...prev,
+                viewportMode:
+                  prev.viewportMode === "kiosk" ? "desktop" : "kiosk",
+              }))
+            }
+            title="Toggle Desktop / 480x320 Kiosk Screen"
+            style={{ marginRight: "4px" }}
+          >
+            {isKiosk ? "🖥️ DESKTOP" : "📟 480×320"}
+          </button>
+          <button
+            className="config-toggle-btn"
+            onClick={() => setIsSettingsOpen(true)}
+            title="Settings"
+          >
+            ⚙️
+          </button>
+        </div>
+      )}
 
       <div style={{ height: "100%", width: "100%" }}>
         {config.appMode === "translator" ? (
           <TranslatorApp config={config} />
         ) : (
-          <TranscriberApp config={config} setConfig={setConfig} />
+          <TranscriberApp
+            config={config}
+            setConfig={setConfig}
+            onOpenSettings={() => setIsSettingsOpen(true)}
+          />
         )}
       </div>
 

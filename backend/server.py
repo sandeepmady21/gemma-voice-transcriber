@@ -223,6 +223,7 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 endpoint_url += "/v1"
             litert_url = f"{endpoint_url}/chat/completions"
             gemma_model = data.get("model_name", "gemma4-e2b")
+            script_mode = data.get("script_mode", "roman")
 
             raw_data = base64.b64decode(audio_b64)
             audio_np = np.frombuffer(raw_data, dtype=np.float32)
@@ -235,10 +236,11 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 speaker_threshold=speaker_threshold,
                 litert_url=litert_url,
                 gemma_model=gemma_model,
+                script_mode=script_mode,
             )
             print(
                 f"[Transcribe] Processed {result['duration']}s in {result['processing_time']}s "
-                f"(turns={len(result['turns'])}, speakers={len(result['speakers'])}, engine={engine_mode})"
+                f"(turns={len(result['turns'])}, speakers={len(result['speakers'])}, engine={engine_mode}, script={script_mode})"
             )
             self._send_json(200, result)
         except Exception as e:
@@ -648,8 +650,9 @@ if __name__ == "__main__":
                     flush=True,
                 )
                 transcriber_engine.diarizer._ensure_extractor()
+                transcriber_engine.prewarm_litert()
                 transcriber_engine.get_whisper_model("small")
-                print("[Prewarm] Diarizer & ASR models pre-warmed successfully.", flush=True)
+                print("[Prewarm] Diarizer, Gemma 4 & ASR models pre-warmed successfully.", flush=True)
             except Exception as e:
                 print(f"[Prewarm Warning] {e}", flush=True)
 
