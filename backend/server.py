@@ -33,7 +33,14 @@ import wave
 
 import numpy as np
 
-from transcriber import LANGUAGE_NAMES, SAMPLE_RATE, transcriber_engine
+from transcriber import (
+    LANGUAGE_NAMES,
+    SAMPLE_RATE,
+    get_saved_gemini_key,
+    save_gemini_key,
+    test_gemini_api_key,
+    transcriber_engine,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SUPPORTED_STT_LANGS = {"en", "ar", "es", "ja", "zh", "ko"}
@@ -224,6 +231,8 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             litert_url = f"{endpoint_url}/chat/completions"
             gemma_model = data.get("model_name", "gemma4-e2b")
             script_mode = data.get("script_mode", "roman")
+            gemini_api_key = data.get("gemini_api_key", "")
+            gemini_model = data.get("gemini_model", "gemini-2.5-flash")
 
             raw_data = base64.b64decode(audio_b64)
             audio_np = np.frombuffer(raw_data, dtype=np.float32)
@@ -237,6 +246,8 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 litert_url=litert_url,
                 gemma_model=gemma_model,
                 script_mode=script_mode,
+                gemini_api_key=gemini_api_key,
+                gemini_model=gemini_model,
             )
             print(
                 f"[Transcribe] Processed {result['duration']}s in {result['processing_time']}s "
@@ -247,6 +258,33 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             traceback.print_exc()
             print(f"[Transcribe Error] {e}")
             self._send_json(500, {"error": str(e)})
+
+    def handle_gemini(self):
+        """
+        GET /api/gemini -> check whether a Gemini API key is saved on the server
+        POST /api/gemini -> save & test a Gemini API key
+        """
+        try:
+            if self.command == "GET":
+                saved = get_saved_gemini_key()
+                masked = f"{saved[:6]}...{saved[-4:]}" if len(saved) > 10 else ""
+                self._send_json(
+                    200, {"has_key": bool(saved), "masked_key": masked}
+                )
+                return
+
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            data = json.loads(body.decode("utf-8"))
+            api_key = (data.get("api_key") or "").strip()
+            model_name = data.get("model", "gemini-2.5-flash")
+
+            if api_key:
+                save_gemini_key(api_key)
+            test_res = test_gemini_api_key(api_key, model_name=model_name)
+            self._send_json(200 if test_res.get("ok") else 400, test_res)
+        except Exception as e:
+            self._send_json(500, {"ok": False, "error": str(e)})
 
     def handle_speakers(self):
         """
@@ -532,6 +570,9 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/api/transcribe"):
             self.handle_transcribe()
             return
+        if self.path.startswith("/api/gemini"):
+            self.handle_gemini()
+            return
         if self.path.startswith("/api/speakers"):
             self.handle_speakers()
             return
@@ -548,6 +589,9 @@ class ProxyHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/proxy"):
             self.handle_proxy()
+            return
+        if self.path.startswith("/api/gemini"):
+            self.handle_gemini()
             return
         if self.path.startswith("/api/speakers"):
             self.handle_speakers()

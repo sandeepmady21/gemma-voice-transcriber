@@ -55,25 +55,48 @@ export async function transcribeConversationChunk(base64Data, options = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       audio_base64: base64Data,
-      engine: options.engine || "gemma4-audio",
+      engine: options.engine || "gemini-cloud",
       whisper_model: options.whisperModel || "small",
       allowed_languages:
         options.allowedLanguages && options.allowedLanguages.length > 0
           ? options.allowedLanguages
           : null,
-      speaker_threshold: options.speakerThreshold ?? 0.45,
+      speaker_threshold: options.speakerThreshold ?? 0.52,
       endpoint_url: options.endpointUrl || "http://localhost:9379/v1",
       model_name: options.modelName || "gemma4-e2b",
       script_mode: options.scriptMode || "roman",
+      gemini_api_key: options.geminiApiKey || "",
+      gemini_model: options.geminiModel || "gemini-2.5-flash",
     }),
   })
 
   if (!response.ok) {
-    const errText = await response.text()
-    throw new Error(`Transcription failed (${response.status}): ${errText}`)
+    let errMsg = `HTTP ${response.status}`
+    try {
+      const errData = await response.json()
+      errMsg = errData.error || errMsg
+    } catch {
+      errMsg = await response.text()
+    }
+    throw new Error(errMsg)
   }
 
   return await response.json()
+}
+
+export async function fetchGeminiKeyStatus() {
+  const res = await fetch("/api/gemini")
+  if (!res.ok) return { has_key: false, masked_key: "" }
+  return await res.json()
+}
+
+export async function saveAndTestGeminiKey(apiKey, model = "gemini-2.5-flash") {
+  const res = await fetch("/api/gemini", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_key: apiKey, model }),
+  })
+  return await res.json()
 }
 
 export async function fetchSpeakers() {

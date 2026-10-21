@@ -612,16 +612,86 @@ class SpeakerDiarizer:
         }
 
 
+GEMINI_KEY_FILE = os.path.join(MODELS_DIR, ".gemini_api_key")
+
+
+def get_saved_gemini_key() -> str:
+    """Returns the Gemini API key from environment or persisted local key file."""
+    env_key = (
+        os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("GOOGLE_API_KEY", "").strip()
+    )
+    if env_key:
+        return env_key
+    if os.path.exists(GEMINI_KEY_FILE):
+        try:
+            with open(GEMINI_KEY_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+
+def save_gemini_key(api_key: str) -> None:
+    """Persists the Gemini API key locally in backend/models/.gemini_api_key."""
+    clean = (api_key or "").strip()
+    os.environ["GEMINI_API_KEY"] = clean
+    try:
+        with open(GEMINI_KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(clean)
+    except Exception as e:
+        print(f"[Gemini] Failed to save key file: {e}", flush=True)
+
+
+def test_gemini_api_key(
+    api_key: str, model_name: str = "gemini-2.5-flash"
+) -> Dict[str, Any]:
+    """Tests whether a Gemini API key is valid and can reach Gemini 2.5 Flash."""
+    key = (api_key or "").strip() or get_saved_gemini_key()
+    if not key:
+        return {"ok": False, "error": "Missing Gemini API Key"}
+
+    target_model = model_name or "gemini-2.5-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={key}"
+    payload: Dict[str, Any] = {
+        "contents": [{"parts": [{"text": "Reply with OK"}]}],
+        "generationConfig": {"maxOutputTokens": 8, "temperature": 0.0},
+    }
+    if "2.5" in target_model:
+        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "candidates" in data:
+                return {"ok": True, "model": target_model}
+            return {"ok": False, "error": "Unexpected response from Gemini API"}
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            msg = err_body.get("error", {}).get("message", str(e))
+        except Exception:
+            msg = str(e)
+        return {"ok": False, "error": msg}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def extract_speech_regions_with_vad(
     audio: np.ndarray,
     sr: int = SAMPLE_RATE,
     max_segment_sec: float = 5.5,
+    min_silence_ms: int = 350,
 ) -> List[Tuple[int, int]]:
     """
     Uses Silero Neural VAD (via faster_whisper.vad) to isolate actual human speech
     segments and discard background room noise / mic clicks.
-    Splits phrases at >=350ms pauses so mid-conversation language & speaker changes
-    are captured cleanly.
     """
     if len(audio) < int(sr * 0.25):
         return []
@@ -634,7 +704,7 @@ def extract_speech_regions_with_vad(
             VadOptions(
                 threshold=0.42,
                 min_speech_duration_ms=250,
-                min_silence_duration_ms=350,
+                min_silence_duration_ms=min_silence_ms,
                 speech_pad_ms=300,
             ),
             sampling_rate=sr,
@@ -662,6 +732,184 @@ def extract_speech_regions_with_vad(
         if peak < 0.02:
             return []
         return [(0, len(audio))]
+
+
+def transcribe_segment_with_gemini(
+    sub_audio: np.ndarray,
+    api_key: str,
+    model_name: str = "gemini-2.5-flash",
+    allowed_languages: Optional[List[str]] = None,
+    script_mode: str = "roman",
+) -> Optional[Dict[str, Any]]:
+    """
+    Transcribes a speech segment using Google Gemini 2.5 Flash Cloud Audio API.
+    Natively handles Telugu (te), Hindi (hi), and English (en) mid-sentence
+    code-switching and outputs clean English/Roman script (Tanglish/Hinglish/English)
+    or Native script (తెలుగు / हिन्दी / English).
+    """
+    key = (api_key or "").strip() or get_saved_gemini_key()
+    if not key:
+        raise ValueError(
+            "Gemini API Key required for Gemini 2.5 Flash Cloud mode. Click '🔑 Set Gemini Key' in the top bar to paste your free Google AI Studio key."
+        )
+
+    wav_bytes = float32_to_wav_bytes(sub_audio, SAMPLE_RATE)
+    wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+
+    if allowed_languages and len(allowed_languages) > 0:
+        lang_hint = ", ".join(
+            f"{get_language_name(c)} ({c})" for c in allowed_languages
+        )
+    else:
+        lang_hint = "Telugu (te), English (en), Hindi (hi)"
+
+    if script_mode == "roman":
+        script_instruction = (
+            "1. Transcribe the EXACT spoken words using ONLY the English/Roman alphabet (Latin script).\n"
+            "   - Write Telugu words in natural, readable Romanized Telugu (Tanglish), e.g., 'Nenu repu office ki vastanu, meeru ela unnaru?'\n"
+            "   - Write Hindi words in natural, readable Romanized Hindi (Hinglish), e.g., 'Main kal subah aaunga, aap kaise ho?'\n"
+            "   - Write English words in standard English.\n"
+            "2. NEVER translate Telugu or Hindi words into English inside the 'text' or 'clauses' fields! Keep the exact spoken Telugu/Hindi words phonetically in English script."
+        )
+    else:
+        script_instruction = (
+            "1. Transcribe the EXACT spoken words in their native script:\n"
+            "   - Write Telugu words in Telugu script (తెలుగు)\n"
+            "   - Write Hindi words in Devanagari script (हिन्दी)\n"
+            "   - Write English words in Latin script (English)\n"
+            "2. NEVER translate the spoken words inside the 'text' or 'clauses' fields."
+        )
+
+    prompt = (
+        f"You are an expert multilingual Indian speech transcriber specializing in {lang_hint} and mid-sentence code-switching.\n"
+        "Listen carefully to this audio clip and follow these rules strictly:\n"
+        f"{script_instruction}\n"
+        "3. Put the complete English meaning/translation of the utterance in 'english_translation'.\n"
+        "4. In 'languages', list all spoken language ISO codes in order of appearance (use 'te' for Telugu, 'en' for English, 'hi' for Hindi).\n"
+        "5. In 'clauses', split the transcript whenever the speaker switches language mid-sentence, tagging each clause with its language code ('te', 'en', 'hi').\n"
+        "6. If the audio contains NO clear human speech (only silence, breathing, clicks, or background noise), return: "
+        '{"is_speech": false, "text": "", "languages": [], "clauses": [], "english_translation": ""}\n\n'
+        "Return ONLY valid JSON with this exact structure:\n"
+        '{"is_speech": true, "text": "...", "languages": ["te", "en"], "clauses": [{"text": "...", "lang": "te"}, {"text": "...", "lang": "en"}], "english_translation": "..."}'
+    )
+
+    models_to_try = [model_name or "gemini-2.5-flash"]
+    if "gemini-2.0-flash" not in models_to_try:
+        models_to_try.append("gemini-2.0-flash")
+
+    last_error = None
+    for candidate_model in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={key}"
+        gen_config: Dict[str, Any] = {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+        }
+        if "2.5" in candidate_model:
+            gen_config["thinkingConfig"] = {"thinkingBudget": 0}
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"inline_data": {"mime_type": "audio/wav", "data": wav_b64}},
+                        {"text": prompt},
+                    ]
+                }
+            ],
+            "generationConfig": gen_config,
+        }
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+
+            candidates = resp_data.get("candidates") or []
+            if not candidates:
+                return None
+            parts = candidates[0].get("content", {}).get("parts") or []
+            raw_text = "".join(p.get("text", "") for p in parts).strip()
+            if not raw_text:
+                return None
+
+            if raw_text.startswith("```"):
+                raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+                raw_text = re.sub(r"\s*```$", "", raw_text)
+            parsed = json.loads(raw_text)
+
+            if not parsed.get("is_speech", True):
+                return None
+
+            text_val = (parsed.get("text") or "").strip()
+            if not text_val or len(text_val) < 2:
+                return None
+
+            raw_langs = parsed.get("languages") or ["en"]
+            norm_langs: List[str] = []
+            for l_item in raw_langs:
+                c = normalize_language_code(str(l_item))
+                if c not in norm_langs:
+                    norm_langs.append(c)
+            if not norm_langs:
+                norm_langs = ["en"]
+
+            raw_clauses = parsed.get("clauses") or []
+            clauses: List[Dict[str, Any]] = []
+            for c_obj in raw_clauses:
+                if isinstance(c_obj, dict) and (c_obj.get("text") or "").strip():
+                    c_lang = normalize_language_code(str(c_obj.get("lang") or norm_langs[0]))
+                    clauses.append(
+                        {
+                            "text": c_obj["text"].strip(),
+                            "lang": c_lang,
+                            "lang_name": get_language_name(c_lang),
+                            "lang_prob": 0.98,
+                        }
+                    )
+                    if c_lang not in norm_langs:
+                        norm_langs.append(c_lang)
+
+            if not clauses:
+                clauses = [
+                    {
+                        "text": text_val,
+                        "lang": norm_langs[0],
+                        "lang_name": get_language_name(norm_langs[0]),
+                        "lang_prob": 0.98,
+                    }
+                ]
+
+            return {
+                "text": text_val,
+                "languages": norm_langs,
+                "clauses": clauses,
+                "english_translation": (parsed.get("english_translation") or "").strip(),
+            }
+        except urllib.error.HTTPError as e:
+            try:
+                err_json = json.loads(e.read().decode("utf-8"))
+                err_msg = err_json.get("error", {}).get("message", str(e))
+            except Exception:
+                err_msg = str(e)
+            last_error = f"Gemini API Error ({e.code}): {err_msg}"
+            print(f"[Gemini-Cloud] {candidate_model} error: {last_error}", flush=True)
+            if e.code in (400, 401, 403) and "API key" in err_msg:
+                raise ValueError(last_error)
+            continue
+        except Exception as e:
+            last_error = str(e)
+            print(f"[Gemini-Cloud] {candidate_model} exception: {last_error}", flush=True)
+            continue
+
+    if last_error and ("API key" in last_error or "quota" in last_error.lower()):
+        raise ValueError(last_error)
+    return None
+
 
 
 def transcribe_segment_with_gemma4(
@@ -894,26 +1142,34 @@ class MultilingualTranscriber:
     def transcribe_conversation_chunk(
         self,
         audio_np: np.ndarray,
-        engine_mode: str = "gemma4-audio",
+        engine_mode: str = "gemini-cloud",
         whisper_model_size: str = "small",
         allowed_languages: Optional[List[str]] = None,
         speaker_threshold: Optional[float] = None,
         litert_url: str = "http://localhost:9379/v1/chat/completions",
         gemma_model: str = "gemma4-e2b",
         script_mode: str = "roman",
+        gemini_api_key: str = "",
+        gemini_model: str = "gemini-2.5-flash",
     ) -> Dict[str, Any]:
         """
         Processes a recorded or streamed audio buffer (16kHz mono float32):
-        1. Filters out silence/noise and splits speech at >=350ms pauses via Silero Neural VAD.
+        1. Filters out silence/noise and splits speech at natural pauses via Silero Neural VAD.
         2. Identifies the speaker for each speech phrase via sherpa-onnx 3D-Speaker voiceprints.
-        3. Transcribes each phrase with Gemma 4 E2B (in Roman/English script or Native script)
+        3. Transcribes each phrase with Gemini 2.5 Flash Cloud (or Gemma 4 / Whisper offline)
            and groups contiguous phrases from the same speaker into rich diarized turns.
         """
         t0 = time.time()
         audio_np = np.asarray(audio_np, dtype=np.float32)
         total_duration = round(len(audio_np) / float(SAMPLE_RATE), 2)
 
-        regions = extract_speech_regions_with_vad(audio_np, sr=SAMPLE_RATE, max_segment_sec=5.5)
+        is_gemini = engine_mode == "gemini-cloud"
+        regions = extract_speech_regions_with_vad(
+            audio_np,
+            sr=SAMPLE_RATE,
+            max_segment_sec=14.0 if is_gemini else 5.5,
+            min_silence_ms=650 if is_gemini else 350,
+        )
         if not regions:
             return {
                 "turns": [],
@@ -931,7 +1187,15 @@ class MultilingualTranscriber:
                 continue
 
             res: Optional[Dict[str, Any]] = None
-            if engine_mode in ("gemma4-audio", "hybrid"):
+            if is_gemini:
+                res = transcribe_segment_with_gemini(
+                    sub_audio,
+                    api_key=gemini_api_key,
+                    model_name=gemini_model,
+                    allowed_languages=allowed_languages,
+                    script_mode=script_mode,
+                )
+            elif engine_mode in ("gemma4-audio", "hybrid"):
                 res = transcribe_segment_with_gemma4(
                     sub_audio,
                     litert_url=litert_url,
@@ -940,7 +1204,7 @@ class MultilingualTranscriber:
                     script_mode=script_mode,
                 )
 
-            if not res or not res.get("text"):
+            if not is_gemini and (not res or not res.get("text")):
                 # Fallback to Faster-Whisper if Gemma 4 is unavailable
                 wm = self.get_whisper_model(whisper_model_size)
                 segs, info = wm.transcribe(
@@ -961,6 +1225,9 @@ class MultilingualTranscriber:
                     "english_translation": "",
                 }
 
+            if not res or not res.get("text"):
+                continue
+
             text = res["text"].strip()
             if not text:
                 continue
@@ -976,7 +1243,7 @@ class MultilingualTranscriber:
                     "text": text,
                     "lang": lang_codes[0],
                     "lang_name": get_language_name(lang_codes[0]),
-                    "lang_prob": 0.95,
+                    "lang_prob": 0.98,
                 }
             ]
             for c in clauses:
@@ -1034,3 +1301,4 @@ class MultilingualTranscriber:
 
 # Singleton instance used by server.py
 transcriber_engine = MultilingualTranscriber()
+

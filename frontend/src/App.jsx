@@ -24,7 +24,9 @@ function App() {
   const [config, setConfig] = useState({
     appMode: localStorage.getItem("appMode") || "transcriber", // "transcriber" | "translator"
     viewportMode: localStorage.getItem("viewportMode") || "desktop", // "desktop" | "kiosk"
-    asrEngine: localStorage.getItem("asrEngine") || "gemma4-audio", // "gemma4-audio" | "hybrid" | "whisper"
+    asrEngine: localStorage.getItem("asrEngine_v2") || "gemini-cloud", // "gemini-cloud" | "gemma4-audio" | "hybrid" | "whisper"
+    geminiApiKey: localStorage.getItem("gemini_api_key") || "",
+    geminiModel: localStorage.getItem("gemini_model") || "gemini-2.5-flash",
     whisperModel: localStorage.getItem("whisperModel") || "small",
     speakerThreshold: parseFloat(
       localStorage.getItem("speakerThreshold") || "0.52",
@@ -64,7 +66,9 @@ function App() {
     localStorage.setItem("keyboardMode", config.keyboardMode)
     localStorage.setItem("appMode", config.appMode)
     localStorage.setItem("viewportMode", config.viewportMode)
-    localStorage.setItem("asrEngine", config.asrEngine)
+    localStorage.setItem("asrEngine_v2", config.asrEngine)
+    localStorage.setItem("gemini_api_key", config.geminiApiKey || "")
+    localStorage.setItem("gemini_model", config.geminiModel || "gemini-2.5-flash")
     localStorage.setItem("whisperModel", config.whisperModel)
     localStorage.setItem("speakerThreshold", String(config.speakerThreshold))
     localStorage.setItem(
@@ -76,6 +80,8 @@ function App() {
     config.appMode,
     config.viewportMode,
     config.asrEngine,
+    config.geminiApiKey,
+    config.geminiModel,
     config.whisperModel,
     config.speakerThreshold,
     config.showEnglishMeaning,
