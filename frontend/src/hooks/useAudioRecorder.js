@@ -204,8 +204,8 @@ export function useAudioRecorder() {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
+            echoCancellation: false,
+            noiseSuppression: false,
             autoGainControl: true,
             channelCount: 1,
           },
@@ -215,7 +215,9 @@ export function useAudioRecorder() {
         isRecordingRef.current = true
 
         // Start instant <100ms interim word preview in parallel
-        startBrowserLivePreview(options.previewLang || "en-IN")
+        if (options.enableBrowserPreview !== false) {
+          startBrowserLivePreview(options.previewLang || "en-IN")
+        }
 
         const AudioContext = window.AudioContext || window.webkitAudioContext
         audioContextRef.current = new AudioContext()
@@ -230,7 +232,6 @@ export function useAudioRecorder() {
         analyserRef.current.fftSize = 256
         source.connect(analyserRef.current)
 
-        // Use 2048 buffer (~42ms at 48kHz) for snappier VAD cut detection
         const bufferSize = 2048
         const scriptProcessor = audioContextRef.current.createScriptProcessor(
           bufferSize,
@@ -247,14 +248,14 @@ export function useAudioRecorder() {
         }
 
         const callbackDurationSec = bufferSize / actualSampleRate
-        // Cut phrase after ~0.48s of pause once speech has started
+        // Wait for a natural sentence pause (~0.85s) so words are never cut in half
         const silenceCallbacksForCut = Math.max(
-          7,
-          Math.round(0.48 / callbackDurationSec),
+          14,
+          Math.round(0.85 / callbackDurationSec),
         )
-        // Or auto-stream after ~3.2s of continuous speech so user sees text while still talking!
-        const maxCallbacksPerChunk = Math.round(3.2 / callbackDurationSec)
-        const preRollFrames = Math.max(4, Math.round(0.3 / callbackDurationSec))
+        // Or stream after ~6.0s of continuous speech at a natural breath dip
+        const maxCallbacksPerChunk = Math.round(6.0 / callbackDurationSec)
+        const preRollFrames = Math.max(7, Math.round(0.35 / callbackDurationSec))
 
         scriptProcessor.onaudioprocess = (e) => {
           const inputData = e.inputBuffer.getChannelData(0)
@@ -270,17 +271,17 @@ export function useAudioRecorder() {
             const st = vadStateRef.current
             st.totalFrames += 1
 
-            if (rms > 0.011) {
+            if (rms > 0.012) {
               st.voicedFrames += 1
               st.silenceFrames = 0
-              if (st.voicedFrames >= 2) {
+              if (st.voicedFrames >= 4) {
                 st.hasSpokenInChunk = true
               }
             } else {
               st.silenceFrames += 1
             }
 
-            // Trim leading silence so chunks start right before speech onset
+            // Trim leading silence so chunks start ~0.35s before speech onset
             if (
               !st.hasSpokenInChunk &&
               recordedSamplesRef.current.length > preRollFrames
@@ -289,18 +290,19 @@ export function useAudioRecorder() {
               st.totalFrames = recordedSamplesRef.current.length
             }
 
-            // Flush immediately on a 0.48s pause, or after 3.2s of speech if at a brief dip
             const pauseReached =
-              st.hasSpokenInChunk && st.silenceFrames >= silenceCallbacksForCut
+              st.hasSpokenInChunk &&
+              st.voicedFrames >= 6 &&
+              st.silenceFrames >= silenceCallbacksForCut
             const maxLenReached =
               st.hasSpokenInChunk &&
               st.totalFrames >= maxCallbacksPerChunk &&
-              (rms < 0.025 || st.totalFrames >= Math.round(4.0 / callbackDurationSec))
+              (rms < 0.016 || st.totalFrames >= Math.round(7.5 / callbackDurationSec))
 
             if (pauseReached || maxLenReached) {
               const overlap = maxLenReached
-                ? recordedSamplesRef.current.slice(-2)
-                : []
+                ? recordedSamplesRef.current.slice(-5)
+                : recordedSamplesRef.current.slice(-3)
               const chunkToFlush = recordedSamplesRef.current.slice()
               recordedSamplesRef.current = overlap
               vadStateRef.current = {
@@ -321,7 +323,7 @@ export function useAudioRecorder() {
                 .then((res) => {
                   if (
                     res &&
-                    res.durationSec >= 0.3 &&
+                    res.durationSec >= 0.5 &&
                     chunkCallbackRef.current
                   ) {
                     chunkCallbackRef.current({

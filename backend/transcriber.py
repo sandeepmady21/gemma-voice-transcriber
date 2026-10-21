@@ -783,22 +783,28 @@ def extract_speech_regions_with_vad(
 def transcribe_segment_with_gemini(
     sub_audio: np.ndarray,
     api_key: str,
-    model_name: str = "gemini-3.1-flash-lite",
+    model_name: str = "gemini-3.5-flash-lite",
     allowed_languages: Optional[List[str]] = None,
     script_mode: str = "roman",
 ) -> Optional[Dict[str, Any]]:
     """
     Ultra-low-latency Gemini Cloud Audio transcription.
-    Reuses a persistent HTTPS keep-alive socket (_HTTP_SESSION) and uses a compact
-    3-line output format (LANG / TEXT / MEANING) with MINIMAL thinking overhead.
+    Normalizes audio gain so quiet/secondary speakers are clear, uses a Telugu/English/Hindi
+    conversational context prompt, and parses single or multi-block responses reliably.
     """
     key = (api_key or "").strip() or get_saved_gemini_key()
     if not key:
         raise ValueError(
-            "Gemini API Key required. Click 'Edit Key' in the sidebar to paste your Google AI Studio key."
+            "Gemini API Key required. Click 'Add Key' in the sidebar to paste your Google AI Studio key."
         )
 
-    wav_bytes = float32_to_wav_bytes(sub_audio, SAMPLE_RATE)
+    # Normalize audio gain so quiet voices or speakers further from the mic are clear
+    norm_audio = np.asarray(sub_audio, dtype=np.float32)
+    peak = float(np.max(np.abs(norm_audio))) if len(norm_audio) > 0 else 0.0
+    if peak > 0.01:
+        norm_audio = np.clip((norm_audio / peak) * 0.85, -0.98, 0.98)
+
+    wav_bytes = float32_to_wav_bytes(norm_audio, SAMPLE_RATE)
     wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
 
     if allowed_languages and len(allowed_languages) > 0:
@@ -810,23 +816,27 @@ def transcribe_segment_with_gemini(
 
     if script_mode == "roman":
         prompt = (
-            f"Transcribe this audio ({lang_hint} / mid-sentence code-switching).\n"
+            f"Transcribe this audio accurately ({lang_hint} / mid-sentence code-switching).\n"
+            "IMPORTANT CONTEXT: The speakers are Indian speakers primarily speaking conversational Telugu (Tanglish), Indian English, or Hindi.\n"
+            "Listen carefully for Telugu words (e.g., babji, mee, nenu, eroju, ekkuva, matladathadu, avunu ra, vachindi, vellanu, chala, bagundi, enti, cheppu) — do NOT confuse spoken Telugu with Hindi!\n"
             "Write Telugu in Romanized Telugu (Tanglish), Hindi in Romanized Hindi (Hinglish), and English in English.\n"
             "Do NOT translate spoken Telugu/Hindi words in TEXT. If silence/noise only, output LANG: NONE.\n"
-            "Respond in this exact 3-line format:\n"
+            "Put ALL spoken words onto a SINGLE TEXT line and a SINGLE MEANING line:\n"
             "LANG: <comma-separated codes: te, en, hi, or NONE>\n"
-            "TEXT: <exact spoken words in English/Roman alphabet>\n"
-            "MEANING: <English translation>"
+            "TEXT: <complete verbatim spoken words in English/Roman alphabet>\n"
+            "MEANING: <complete English translation>"
         )
     else:
         prompt = (
-            f"Transcribe this audio ({lang_hint} / mid-sentence code-switching).\n"
+            f"Transcribe this audio accurately ({lang_hint} / mid-sentence code-switching).\n"
+            "IMPORTANT CONTEXT: The speakers are Indian speakers primarily speaking conversational Telugu, Indian English, or Hindi.\n"
+            "Listen carefully for Telugu speech — do NOT confuse spoken Telugu with Hindi!\n"
             "Write Telugu in తెలుగు script, Hindi in हिन्दी script, and English in Latin script.\n"
             "Do NOT translate spoken words in TEXT. If silence/noise only, output LANG: NONE.\n"
-            "Respond in this exact 3-line format:\n"
+            "Put ALL spoken words onto a SINGLE TEXT line and a SINGLE MEANING line:\n"
             "LANG: <comma-separated codes: te, en, hi, or NONE>\n"
-            "TEXT: <exact spoken words in native script>\n"
-            "MEANING: <English translation>"
+            "TEXT: <complete verbatim spoken words in native script>\n"
+            "MEANING: <complete English translation>"
         )
 
     models_to_try = _resolve_gemini_candidates(model_name)
@@ -834,7 +844,7 @@ def transcribe_segment_with_gemini(
     last_error = None
     for candidate_model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={key}"
-        gen_config = _build_gemini_gen_config(candidate_model, max_tokens=180)
+        gen_config = _build_gemini_gen_config(candidate_model, max_tokens=220)
 
         payload = {
             "contents": [
@@ -874,27 +884,37 @@ def transcribe_segment_with_gemini(
             if not raw_reply:
                 return {"text": "", "silence": True}
 
-            lang_line = ""
-            text_line = ""
-            meaning_line = ""
+            lang_parts: List[str] = []
+            text_parts: List[str] = []
+            meaning_parts: List[str] = []
 
             for line in raw_reply.splitlines():
-                s = line.strip()
+                s = line.strip().strip("*_ ")
                 if not s:
                     continue
                 u = s.upper()
                 if u.startswith("LANG:") or u.startswith("LANGUAGE:"):
-                    lang_line = s.split(":", 1)[1].strip()
+                    val = s.split(":", 1)[1].strip().strip("*_ ")
+                    if val:
+                        lang_parts.append(val)
                 elif u.startswith("TEXT:") or u.startswith("ROMAN:") or u.startswith("TRANSCRIPT:"):
-                    text_line = s.split(":", 1)[1].strip()
+                    val = s.split(":", 1)[1].strip().strip("*_ \"'`")
+                    if val and val.upper() not in ("NONE", "N/A", "SILENCE", "[SILENCE]", "<NOISE>"):
+                        text_parts.append(val)
                 elif u.startswith("MEANING:") or u.startswith("TRANSLATION:"):
-                    meaning_line = s.split(":", 1)[1].strip()
+                    val = s.split(":", 1)[1].strip().strip("*_ \"'`")
+                    if val and val.upper() not in ("NONE", "N/A", "SILENCE", "[SILENCE]"):
+                        meaning_parts.append(val)
+
+            lang_line = ", ".join(lang_parts)
+            text_line = " ".join(text_parts).strip()
+            meaning_line = " ".join(meaning_parts).strip()
 
             if not text_line:
                 cleaned = [
                     l.strip()
                     for l in raw_reply.splitlines()
-                    if not l.strip().upper().startswith(("LANG:", "LANGUAGE:", "MEANING:", "TRANSLATION:"))
+                    if not l.strip().upper().startswith(("LANG:", "LANGUAGE:", "MEANING:", "TRANSLATION:", "NATIVE:"))
                 ]
                 text_line = " ".join(cleaned).strip()
 
@@ -903,8 +923,8 @@ def transcribe_segment_with_gemini(
 
             if (
                 not text_line
-                or "NONE" in lang_line.upper()
-                or text_line.upper() in ("NONE", "N/A", "SILENCE", "[SILENCE]", "NULL")
+                or ("NONE" in lang_line.upper() and len(text_parts) == 0)
+                or text_line.upper() in ("NONE", "N/A", "SILENCE", "[SILENCE]", "NULL", "<NOISE>")
                 or len(text_line) < 2
             ):
                 return {"text": "", "silence": True}
@@ -913,7 +933,7 @@ def transcribe_segment_with_gemini(
             if lang_line:
                 for part in re.split(r"[,+/&]|\band\b", lang_line, flags=re.IGNORECASE):
                     part = part.strip()
-                    if part:
+                    if part and part.upper() != "NONE":
                         code = normalize_language_code(part)
                         if code not in declared_langs:
                             declared_langs.append(code)
@@ -1199,8 +1219,8 @@ class MultilingualTranscriber:
         regions = extract_speech_regions_with_vad(
             audio_np,
             sr=SAMPLE_RATE,
-            max_segment_sec=8.0 if is_gemini else 5.5,
-            min_silence_ms=420 if is_gemini else 350,
+            max_segment_sec=12.0 if is_gemini else 6.0,
+            min_silence_ms=950 if is_gemini else 450,
         )
         if not regions:
             return {

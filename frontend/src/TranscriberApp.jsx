@@ -346,35 +346,37 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         second: "2-digit",
       })
 
-      // Immediately lock the live preview text onto the screen as a transcript turn
-      // so the user's words never disappear when pausing or stopping!
-      let pendingId = null
-      if (cleanPreview) {
-        pendingId = `live_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-        const fallbackSpk = speakers[0] || {
-          id: "spk_1",
-          label: "Speaker 1",
-          color: "#6366f1",
-          index: 1,
-        }
-        setTurns((prev) => [
-          ...prev,
-          {
-            id: pendingId,
-            speaker_id: fallbackSpk.id,
-            speaker_label: fallbackSpk.label,
-            speaker_color: fallbackSpk.color || "#6366f1",
-            speaker_index: fallbackSpk.index || 1,
-            languages: [{ code: "en", name: "Live" }],
-            language_switched: false,
-            clauses: [{ text: cleanPreview, lang: "en", lang_name: "Live" }],
-            text: cleanPreview,
-            english_translation: "",
-            timestamp: nowTimestamp,
-            isRefining: Boolean(base64Data),
-          },
-        ])
+      // Immediately insert a visible turn card on screen so the user sees their phrase right away
+      const pendingId = `live_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+      const fallbackSpk = speakers[0] || {
+        id: "spk_1",
+        label: "Speaker 1",
+        color: "#6366f1",
+        index: 1,
       }
+      setTurns((prev) => [
+        ...prev,
+        {
+          id: pendingId,
+          speaker_id: fallbackSpk.id,
+          speaker_label: fallbackSpk.label,
+          speaker_color: fallbackSpk.color || "#6366f1",
+          speaker_index: fallbackSpk.index || 1,
+          languages: [{ code: "en", name: cleanPreview ? "Live" : "Processing" }],
+          language_switched: false,
+          clauses: [
+            {
+              text: cleanPreview || "Transcribing spoken phrase...",
+              lang: "en",
+              lang_name: "Live",
+            },
+          ],
+          text: cleanPreview || "Transcribing spoken phrase...",
+          english_translation: "",
+          timestamp: nowTimestamp,
+          isRefining: Boolean(base64Data),
+        },
+      ])
 
       if (!base64Data) return
       setInFlightCount((c) => c + 1)
@@ -389,7 +391,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           modelName: config.modelName,
           scriptMode,
           geminiApiKey: config.geminiApiKey || "",
-          geminiModel: config.geminiModel || "gemini-3.1-flash-lite",
+          geminiModel: config.geminiModel || "gemini-3.5-flash-lite",
         })
 
         if (res.speakers) {
@@ -406,7 +408,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           }))
 
           setTurns((prev) => {
-            if (pendingId && prev.some((t) => t.id === pendingId)) {
+            if (prev.some((t) => t.id === pendingId)) {
               const out = []
               for (const item of prev) {
                 if (item.id === pendingId) {
@@ -427,24 +429,26 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           setStatusMessage(
             `${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
           )
-        } else if (pendingId) {
-          // Keep the user's live preview text permanently on screen even if backend VAD returned 0 turns
+        } else {
+          // If backend detected silence/no words, keep only if we had valid English preview text
           setTurns((prev) =>
-            prev.map((t) =>
-              t.id === pendingId ? { ...t, isRefining: false } : t,
-            ),
+            cleanPreview
+              ? prev.map((t) =>
+                  t.id === pendingId ? { ...t, isRefining: false } : t,
+                )
+              : prev.filter((t) => t.id !== pendingId),
           )
         }
       } catch (err) {
         console.error("Transcription error:", err)
         setStatusMessage(`Error: ${err.message}`)
-        if (pendingId) {
-          setTurns((prev) =>
-            prev.map((t) =>
-              t.id === pendingId ? { ...t, isRefining: false } : t,
-            ),
-          )
-        }
+        setTurns((prev) =>
+          cleanPreview
+            ? prev.map((t) =>
+                t.id === pendingId ? { ...t, isRefining: false } : t,
+              )
+            : prev.filter((t) => t.id !== pendingId),
+        )
         if (err.message && err.message.toLowerCase().includes("api key")) {
           setShowKeyEditor(true)
         }
@@ -462,6 +466,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     }
     return "en-IN"
   }, [selectedLangs])
+
+  // Browser Web Speech API only understands a single language and outputs native script for te-IN/hi-IN,
+  // so only enable it when English-only or single-language Native mode is selected.
+  const shouldUseBrowserPreview =
+    (selectedLangs.length === 1 && selectedLangs[0] === "en") ||
+    (selectedLangs.length === 1 && scriptMode === "native")
 
   const handleToggleRecord = useCallback(async () => {
     if (activeEngine === "gemini-cloud" && !isGeminiReady) {
@@ -486,6 +496,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       setStatusMessage("Listening — streaming phrases live")
       await startRecording({
         continuous: false,
+        enableBrowserPreview: shouldUseBrowserPreview,
         previewLang: getPreviewLang(),
         onChunkReady: (chunkObj) => {
           if (chunkObj && (chunkObj.base64Data || chunkObj.previewText)) {
@@ -505,6 +516,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     stopRecording,
     dispatchAudioChunk,
     getPreviewLang,
+    shouldUseBrowserPreview,
   ])
 
   const handleToggleContinuous = useCallback(async () => {
@@ -532,6 +544,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       setStatusMessage("Auto-Listen active — hands-free streaming")
       await startRecording({
         continuous: true,
+        enableBrowserPreview: shouldUseBrowserPreview,
         previewLang: getPreviewLang(),
         onChunkReady: (chunkObj) => {
           if (chunkObj && (chunkObj.base64Data || chunkObj.previewText)) {
@@ -552,6 +565,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     stopRecording,
     dispatchAudioChunk,
     getPreviewLang,
+    shouldUseBrowserPreview,
   ])
 
   useEffect(() => {
