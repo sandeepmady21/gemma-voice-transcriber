@@ -166,7 +166,18 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     micError,
   } = useAudioRecorder()
 
-  const [turns, setTurns] = useState([])
+  const [turns, setTurns] = useState(() => {
+    try {
+      const saved = localStorage.getItem("transcriber_saved_turns_v1")
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        if (Array.isArray(parsed)) return parsed
+      }
+    } catch (e) {
+      // Ignore storage parse error
+    }
+    return []
+  })
   const [speakers, setSpeakers] = useState([])
   const [inFlightCount, setInFlightCount] = useState(0)
   const [statusMessage, setStatusMessage] = useState("Ready to transcribe")
@@ -207,6 +218,35 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   useEffect(() => {
     localStorage.setItem("transcriber_script_mode", scriptMode)
   }, [scriptMode])
+
+  // Persist transcript turns to localStorage so recordings stay on screen even after refresh
+  useEffect(() => {
+    try {
+      const compactTurns = turns.slice(-80).map((t, idx, arr) => {
+        // Keep playable WAV audio on the most recent 12 turns so localStorage stays well under 5MB
+        if (idx < arr.length - 12 && t.audio_wav_b64) {
+          const { audio_wav_b64, ...rest } = t
+          return rest
+        }
+        return t
+      })
+      localStorage.setItem(
+        "transcriber_saved_turns_v1",
+        JSON.stringify(compactTurns),
+      )
+    } catch (e) {
+      // If quota exceeded, save without audio blobs
+      try {
+        const textOnly = turns.slice(-80).map(({ audio_wav_b64, ...rest }) => rest)
+        localStorage.setItem(
+          "transcriber_saved_turns_v1",
+          JSON.stringify(textOnly),
+        )
+      } catch (err) {
+        // Ignore
+      }
+    }
+  }, [turns])
 
   useEffect(() => {
     fetchSpeakers()
@@ -262,7 +302,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     try {
       const res = await saveAndTestGeminiKey(
         trimmed,
-        config.geminiModel || "gemini-2.5-flash",
+        config.geminiModel || "gemini-3.1-flash-lite",
       )
       if (res.ok) {
         setHasServerKey(true)
@@ -278,9 +318,9 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         }))
         setKeyFeedback({
           ok: true,
-          msg: "Connected to Gemini 2.5 Flash",
+          msg: "Connected to Gemini Cloud Flash",
         })
-        setStatusMessage("Gemini 2.5 Flash connected — ready to record")
+        setStatusMessage("Gemini Cloud connected — ready to record")
         setTimeout(() => setShowKeyEditor(false), 600)
       } else {
         setKeyFeedback({
@@ -296,7 +336,46 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   }
 
   const dispatchAudioChunk = useCallback(
-    async (base64Data) => {
+    async (base64Data, previewText = "") => {
+      const cleanPreview = (previewText || "").trim()
+      if (!base64Data && !cleanPreview) return
+
+      const nowTimestamp = new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+
+      // Immediately lock the live preview text onto the screen as a transcript turn
+      // so the user's words never disappear when pausing or stopping!
+      let pendingId = null
+      if (cleanPreview) {
+        pendingId = `live_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+        const fallbackSpk = speakers[0] || {
+          id: "spk_1",
+          label: "Speaker 1",
+          color: "#6366f1",
+          index: 1,
+        }
+        setTurns((prev) => [
+          ...prev,
+          {
+            id: pendingId,
+            speaker_id: fallbackSpk.id,
+            speaker_label: fallbackSpk.label,
+            speaker_color: fallbackSpk.color || "#6366f1",
+            speaker_index: fallbackSpk.index || 1,
+            languages: [{ code: "en", name: "Live" }],
+            language_switched: false,
+            clauses: [{ text: cleanPreview, lang: "en", lang_name: "Live" }],
+            text: cleanPreview,
+            english_translation: "",
+            timestamp: nowTimestamp,
+            isRefining: Boolean(base64Data),
+          },
+        ])
+      }
+
       if (!base64Data) return
       setInFlightCount((c) => c + 1)
 
@@ -310,7 +389,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           modelName: config.modelName,
           scriptMode,
           geminiApiKey: config.geminiApiKey || "",
-          geminiModel: config.geminiModel || "gemini-2.5-flash",
+          geminiModel: config.geminiModel || "gemini-3.1-flash-lite",
         })
 
         if (res.speakers) {
@@ -319,22 +398,28 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
         if (res.turns && res.turns.length > 0) {
           playBlip("speaker")
-          setLivePreviewText("")
+          const finalizedTurns = res.turns.map((newTurn) => ({
+            ...newTurn,
+            timestamp: nowTimestamp,
+            procTime: res.processing_time,
+            isRefining: false,
+          }))
+
           setTurns((prev) => {
-            const updated = [...prev]
-            for (const newTurn of res.turns) {
-              updated.push({
-                ...newTurn,
-                timestamp: new Date().toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                  second: "2-digit",
-                }),
-                procTime: res.processing_time,
-              })
+            if (pendingId && prev.some((t) => t.id === pendingId)) {
+              const out = []
+              for (const item of prev) {
+                if (item.id === pendingId) {
+                  out.push(...finalizedTurns)
+                } else {
+                  out.push(item)
+                }
+              }
+              return out
             }
-            return updated
+            return [...prev, ...finalizedTurns]
           })
+
           const lastTurn = res.turns[res.turns.length - 1]
           const langList = (lastTurn.languages || [])
             .map((l) => l.name)
@@ -342,10 +427,24 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           setStatusMessage(
             `${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
           )
+        } else if (pendingId) {
+          // Keep the user's live preview text permanently on screen even if backend VAD returned 0 turns
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.id === pendingId ? { ...t, isRefining: false } : t,
+            ),
+          )
         }
       } catch (err) {
         console.error("Transcription error:", err)
         setStatusMessage(`Error: ${err.message}`)
+        if (pendingId) {
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.id === pendingId ? { ...t, isRefining: false } : t,
+            ),
+          )
+        }
         if (err.message && err.message.toLowerCase().includes("api key")) {
           setShowKeyEditor(true)
         }
@@ -353,7 +452,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         setInFlightCount((c) => Math.max(0, c - 1))
       }
     },
-    [config, activeEngine, selectedLangs, scriptMode, setLivePreviewText],
+    [config, activeEngine, selectedLangs, scriptMode, speakers],
   )
 
   const getPreviewLang = useCallback(() => {
@@ -373,8 +472,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
     if (isRecording) {
       const audioData = await stopRecording()
-      if (audioData && audioData.base64Data && audioData.durationSec >= 0.3) {
-        dispatchAudioChunk(audioData.base64Data)
+      if (
+        audioData &&
+        ((audioData.base64Data && audioData.durationSec >= 0.25) ||
+          audioData.previewText)
+      ) {
+        dispatchAudioChunk(audioData.base64Data, audioData.previewText || "")
       } else {
         setStatusMessage("Ready to transcribe")
       }
@@ -385,8 +488,11 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         continuous: false,
         previewLang: getPreviewLang(),
         onChunkReady: (chunkObj) => {
-          if (chunkObj && chunkObj.base64Data) {
-            dispatchAudioChunk(chunkObj.base64Data)
+          if (chunkObj && (chunkObj.base64Data || chunkObj.previewText)) {
+            dispatchAudioChunk(
+              chunkObj.base64Data,
+              chunkObj.previewText || "",
+            )
           }
         },
       })
@@ -410,8 +516,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
 
     if (isRecording && isContinuous) {
       const leftover = await stopRecording()
-      if (leftover && leftover.base64Data && leftover.durationSec >= 0.3) {
-        dispatchAudioChunk(leftover.base64Data)
+      if (
+        leftover &&
+        ((leftover.base64Data && leftover.durationSec >= 0.25) ||
+          leftover.previewText)
+      ) {
+        dispatchAudioChunk(leftover.base64Data, leftover.previewText || "")
       }
       setStatusMessage("Auto-Listen paused")
     } else {
@@ -424,8 +534,11 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         continuous: true,
         previewLang: getPreviewLang(),
         onChunkReady: (chunkObj) => {
-          if (chunkObj && chunkObj.base64Data) {
-            dispatchAudioChunk(chunkObj.base64Data)
+          if (chunkObj && (chunkObj.base64Data || chunkObj.previewText)) {
+            dispatchAudioChunk(
+              chunkObj.base64Data,
+              chunkObj.previewText || "",
+            )
           }
         },
       })
@@ -576,11 +689,18 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   }
 
   const handleSpeakTurn = (turn) => {
-    if (!turn || !turn.text) return
+    if (!turn) return
     if (audioPlayerRef.current) {
       audioPlayerRef.current.pause()
       audioPlayerRef.current = null
     }
+    if (turn.audio_wav_b64) {
+      const player = new Audio(`data:audio/wav;base64,${turn.audio_wav_b64}`)
+      audioPlayerRef.current = player
+      player.play().catch(() => {})
+      return
+    }
+    if (!turn.text) return
     const primaryLang = turn.languages?.[0]?.code || "en"
     const supportedMoonshine = ["en", "es", "ar", "ja", "zh", "ko"]
     if (supportedMoonshine.includes(primaryLang)) {
@@ -953,7 +1073,14 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
             </button>
             <button
               className="pro-Button-ghost danger"
-              onClick={() => setTurns([])}
+              onClick={() => {
+                setTurns([])
+                try {
+                  localStorage.removeItem("transcriber_saved_turns_v1")
+                } catch (e) {
+                  // Ignore
+                }
+              }}
               disabled={turns.length === 0}
             >
               Clear
@@ -1091,6 +1218,12 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                           )
                         })}
 
+                        {turn.isRefining && (
+                          <span className="pro-switch-tag">
+                            Refining speaker & script...
+                          </span>
+                        )}
+
                         {turn.language_switched && (
                           <span className="pro-switch-tag">Code-Switched</span>
                         )}
@@ -1110,9 +1243,13 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                           <button
                             className="pro-icon-btn"
                             onClick={() => handleSpeakTurn(turn)}
-                            title="Read aloud"
+                            title={
+                              turn.audio_wav_b64
+                                ? "Play recorded voice clip"
+                                : "Read aloud"
+                            }
                           >
-                            Listen
+                            {turn.audio_wav_b64 ? "▶ Play Recording" : "Listen"}
                           </button>
                         </div>
                       </div>

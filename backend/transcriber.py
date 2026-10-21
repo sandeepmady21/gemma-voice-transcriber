@@ -653,37 +653,80 @@ def save_gemini_key(api_key: str) -> None:
         print(f"[Gemini] Failed to save key file: {e}", flush=True)
 
 
+RECORDINGS_DIR = os.path.join( os.path.dirname(MODELS_DIR), "recordings" )
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+# Cache any models that returned 404 for this API key so we never waste latency retrying them
+_DEPRECATED_MODELS_CACHE: set = set()
+
+
+def _resolve_gemini_candidates(requested_model: str) -> List[str]:
+    """
+    Returns ordered candidate Gemini models supporting low-latency audio transcription.
+    Automatically skips models deprecated for newer Google AI Studio keys (e.g. 2.5/2.0-flash 404s).
+    """
+    default_chain = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash",
+    ]
+    req = (requested_model or "").strip()
+    # Map legacy default names directly to the active 3.5/3.1 flash-lite chain
+    if not req or req in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.1-flash-lite"):
+        chain = default_chain
+    else:
+        chain = [req] + [m for m in default_chain if m != req]
+    return [m for m in chain if m not in _DEPRECATED_MODELS_CACHE] or default_chain
+
+
+def _build_gemini_gen_config(model_name: str, max_tokens: int = 180) -> Dict[str, Any]:
+    gen_config: Dict[str, Any] = {
+        "temperature": 0.0,
+        "maxOutputTokens": max_tokens,
+    }
+    if any(k in model_name for k in ("3.1", "3.5", "flash-lite")):
+        gen_config["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
+    elif "2.5" in model_name:
+        gen_config["thinkingConfig"] = {"thinkingBudget": 0}
+    return gen_config
+
+
 def test_gemini_api_key(
-    api_key: str, model_name: str = "gemini-2.5-flash"
+    api_key: str, model_name: str = "gemini-3.1-flash-lite"
 ) -> Dict[str, Any]:
     """Tests whether a Gemini API key is valid and warms up the persistent TLS connection."""
     key = (api_key or "").strip() or get_saved_gemini_key()
     if not key:
         return {"ok": False, "error": "Missing Gemini API Key"}
 
-    target_model = model_name or "gemini-2.5-flash"
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={key}"
-    payload: Dict[str, Any] = {
-        "contents": [{"parts": [{"text": "ok"}]}],
-        "generationConfig": {"maxOutputTokens": 4, "temperature": 0.0},
-    }
-    if "2.5" in target_model:
-        payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
-
-    try:
-        resp = _HTTP_SESSION.post(url, json=payload, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            if "candidates" in data:
-                return {"ok": True, "model": target_model}
+    last_err = "Unknown error"
+    for target_model in _resolve_gemini_candidates(model_name):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={key}"
+        payload: Dict[str, Any] = {
+            "contents": [{"parts": [{"text": "ok"}]}],
+            "generationConfig": _build_gemini_gen_config(target_model, max_tokens=4),
+        }
         try:
-            err_body = resp.json()
-            msg = err_body.get("error", {}).get("message", resp.text)
-        except Exception:
-            msg = resp.text
-        return {"ok": False, "error": msg}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+            resp = _HTTP_SESSION.post(url, json=payload, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "candidates" in data:
+                    return {"ok": True, "model": target_model}
+            try:
+                err_body = resp.json()
+                msg = err_body.get("error", {}).get("message", resp.text)
+            except Exception:
+                msg = resp.text
+            last_err = msg
+            if resp.status_code == 404:
+                _DEPRECATED_MODELS_CACHE.add(target_model)
+                continue
+            if resp.status_code in (400, 401, 403) and "API key" in msg:
+                return {"ok": False, "error": msg}
+        except Exception as e:
+            last_err = str(e)
+    return {"ok": False, "error": last_err}
 
 
 def extract_speech_regions_with_vad(
@@ -705,8 +748,8 @@ def extract_speech_regions_with_vad(
         ts = get_speech_timestamps(
             audio,
             VadOptions(
-                threshold=0.42,
-                min_speech_duration_ms=220,
+                threshold=0.40,
+                min_speech_duration_ms=200,
                 min_silence_duration_ms=min_silence_ms,
                 speech_pad_ms=260,
             ),
@@ -720,13 +763,13 @@ def extract_speech_regions_with_vad(
         for seg in ts:
             s_samp = max(0, int(seg["start"]))
             e_samp = min(len(audio), int(seg["end"]))
-            if e_samp - s_samp < int(0.22 * sr):
+            if e_samp - s_samp < int(0.20 * sr):
                 continue
             cur = s_samp
             while e_samp - cur > max_samps:
                 regions.append((cur, cur + max_samps))
                 cur += max_samps
-            if e_samp - cur >= int(0.22 * sr):
+            if e_samp - cur >= int(0.20 * sr):
                 regions.append((cur, e_samp))
         return regions
     except Exception as e:
@@ -740,20 +783,19 @@ def extract_speech_regions_with_vad(
 def transcribe_segment_with_gemini(
     sub_audio: np.ndarray,
     api_key: str,
-    model_name: str = "gemini-2.5-flash",
+    model_name: str = "gemini-3.1-flash-lite",
     allowed_languages: Optional[List[str]] = None,
     script_mode: str = "roman",
 ) -> Optional[Dict[str, Any]]:
     """
-    Ultra-low-latency Gemini Cloud Audio transcription (~350-650ms).
+    Ultra-low-latency Gemini Cloud Audio transcription.
     Reuses a persistent HTTPS keep-alive socket (_HTTP_SESSION) and uses a compact
-    3-line output format (LANG / TEXT / MEANING) to minimize output token generation time,
-    then runs local sub-millisecond clause segmentation.
+    3-line output format (LANG / TEXT / MEANING) with MINIMAL thinking overhead.
     """
     key = (api_key or "").strip() or get_saved_gemini_key()
     if not key:
         raise ValueError(
-            "Gemini API Key required. Click '🔑 Set Gemini Key' in the top bar to paste your free Google AI Studio key."
+            "Gemini API Key required. Click 'Edit Key' in the sidebar to paste your Google AI Studio key."
         )
 
     wav_bytes = float32_to_wav_bytes(sub_audio, SAMPLE_RATE)
@@ -787,20 +829,12 @@ def transcribe_segment_with_gemini(
             "MEANING: <English translation>"
         )
 
-    # Try gemini-2.0-flash / gemini-2.5-flash (with thinkingBudget=0 for minimum latency)
-    models_to_try = [model_name or "gemini-2.5-flash"]
-    if "gemini-2.0-flash" not in models_to_try:
-        models_to_try.append("gemini-2.0-flash")
+    models_to_try = _resolve_gemini_candidates(model_name)
 
     last_error = None
     for candidate_model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent?key={key}"
-        gen_config: Dict[str, Any] = {
-            "temperature": 0.0,
-            "maxOutputTokens": 180,
-        }
-        if "2.5" in candidate_model:
-            gen_config["thinkingConfig"] = {"thinkingBudget": 0}
+        gen_config = _build_gemini_gen_config(candidate_model, max_tokens=180)
 
         payload = {
             "contents": [
@@ -815,7 +849,7 @@ def transcribe_segment_with_gemini(
         }
 
         try:
-            resp = _HTTP_SESSION.post(url, json=payload, timeout=15)
+            resp = _HTTP_SESSION.post(url, json=payload, timeout=12)
             if resp.status_code != 200:
                 try:
                     err_json = resp.json()
@@ -824,6 +858,9 @@ def transcribe_segment_with_gemini(
                     err_msg = resp.text
                 last_error = f"Gemini API Error ({resp.status_code}): {err_msg}"
                 print(f"[Gemini-Cloud] {candidate_model} error: {last_error}", flush=True)
+                if resp.status_code == 404:
+                    _DEPRECATED_MODELS_CACHE.add(candidate_model)
+                    continue
                 if resp.status_code in (400, 401, 403) and "API key" in err_msg:
                     raise ValueError(last_error)
                 continue
@@ -831,11 +868,11 @@ def transcribe_segment_with_gemini(
             resp_data = resp.json()
             candidates = resp_data.get("candidates") or []
             if not candidates:
-                return None
+                return {"text": "", "silence": True}
             parts = candidates[0].get("content", {}).get("parts") or []
             raw_reply = "".join(p.get("text", "") for p in parts).strip()
             if not raw_reply:
-                return None
+                return {"text": "", "silence": True}
 
             lang_line = ""
             text_line = ""
@@ -870,7 +907,7 @@ def transcribe_segment_with_gemini(
                 or text_line.upper() in ("NONE", "N/A", "SILENCE", "[SILENCE]", "NULL")
                 or len(text_line) < 2
             ):
-                return None
+                return {"text": "", "silence": True}
 
             declared_langs: List[str] = []
             if lang_line:
@@ -1217,7 +1254,7 @@ class MultilingualTranscriber:
                     script_mode=script_mode,
                 )
 
-            if not is_gemini and (not res or not res.get("text")):
+            if (not res or not res.get("text")) and not (res and res.get("silence")):
                 wm = self.get_whisper_model(whisper_model_size)
                 segs, info = wm.transcribe(
                     sub_audio,
@@ -1247,6 +1284,7 @@ class MultilingualTranscriber:
             segment_results = [_process_one_segment(seg) for seg in valid_segments]
 
         turns: List[Dict[str, Any]] = []
+        turn_audio_buffers: List[List[np.ndarray]] = []
 
         for s_samp, e_samp, sub_audio, res in segment_results:
             if not res or not res.get("text"):
@@ -1280,6 +1318,7 @@ class MultilingualTranscriber:
                 prev["end"] = round(e_samp / float(SAMPLE_RATE), 2)
                 prev["text"] = f"{prev['text']} {text}".strip()
                 prev["clauses"].extend(clauses)
+                turn_audio_buffers[-1].append(sub_audio)
                 if eng_meaning:
                     prev["english_translation"] = (
                         f"{prev.get('english_translation', '')} {eng_meaning}".strip()
@@ -1291,9 +1330,10 @@ class MultilingualTranscriber:
                         existing_codes.add(lc)
                 prev["language_switched"] = len(prev["languages"]) > 1
             else:
+                turn_id = f"turn_{int(time.time() * 1000)}_{len(turns) + 1}"
                 turns.append(
                     {
-                        "id": f"turn_{int(time.time() * 1000)}_{len(turns) + 1}",
+                        "id": turn_id,
                         "speaker_id": spk_info["id"],
                         "speaker_label": spk_info["label"],
                         "speaker_color": spk_info["color"],
@@ -1310,6 +1350,21 @@ class MultilingualTranscriber:
                         "english_translation": eng_meaning,
                     }
                 )
+                turn_audio_buffers.append([sub_audio])
+
+        # Attach playable WAV base64 and save WAV file to backend/recordings/ for each turn
+        for idx, turn_obj in enumerate(turns):
+            try:
+                joined_audio = np.concatenate(turn_audio_buffers[idx])
+                wav_bytes = float32_to_wav_bytes(joined_audio, SAMPLE_RATE)
+                turn_obj["audio_wav_b64"] = base64.b64encode(wav_bytes).decode("utf-8")
+                rec_filename = f"{turn_obj['id']}.wav"
+                rec_path = os.path.join(RECORDINGS_DIR, rec_filename)
+                with open(rec_path, "wb") as wf:
+                    wf.write(wav_bytes)
+                turn_obj["recording_file"] = f"backend/recordings/{rec_filename}"
+            except Exception as e:
+                print(f"[Recordings] Warning saving turn audio: {e}", flush=True)
 
         proc_time = round(time.time() - t0, 2)
         return {
