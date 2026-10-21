@@ -206,6 +206,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
   const [copiedId, setCopiedId] = useState(null)
 
   const feedEndRef = useRef(null)
+  const prevTurnsLenRef = useRef(turns.length)
   const fileInputRef = useRef(null)
   const audioPlayerRef = useRef(null)
 
@@ -270,11 +271,15 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
       .catch(() => {})
   }, [])
 
+  // Only scroll when a new finalized turn is added — prevents screen jerks during background polls
   useEffect(() => {
-    if (feedEndRef.current && viewMode === "feed") {
-      feedEndRef.current.scrollIntoView({ behavior: "smooth" })
+    if (turns.length > prevTurnsLenRef.current) {
+      if (feedEndRef.current && viewMode === "feed") {
+        feedEndRef.current.scrollIntoView({ behavior: "smooth", block: "end" })
+      }
     }
-  }, [turns, isProcessing, livePreviewText, viewMode])
+    prevTurnsLenRef.current = turns.length
+  }, [turns.length, viewMode])
 
   useEffect(() => {
     if (!isRecording) {
@@ -302,7 +307,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     try {
       const res = await saveAndTestGeminiKey(
         trimmed,
-        config.geminiModel || "gemini-3.1-flash-lite",
+        config.geminiModel || "gemini-3.5-flash-lite",
       )
       if (res.ok) {
         setHasServerKey(true)
@@ -346,38 +351,6 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         second: "2-digit",
       })
 
-      // Immediately insert a visible turn card on screen so the user sees their phrase right away
-      const pendingId = `live_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      const fallbackSpk = speakers[0] || {
-        id: "spk_1",
-        label: "Speaker 1",
-        color: "#6366f1",
-        index: 1,
-      }
-      setTurns((prev) => [
-        ...prev,
-        {
-          id: pendingId,
-          speaker_id: fallbackSpk.id,
-          speaker_label: fallbackSpk.label,
-          speaker_color: fallbackSpk.color || "#6366f1",
-          speaker_index: fallbackSpk.index || 1,
-          languages: [{ code: "en", name: cleanPreview ? "Live" : "Processing" }],
-          language_switched: false,
-          clauses: [
-            {
-              text: cleanPreview || "Transcribing spoken phrase...",
-              lang: "en",
-              lang_name: "Live",
-            },
-          ],
-          text: cleanPreview || "Transcribing spoken phrase...",
-          english_translation: "",
-          timestamp: nowTimestamp,
-          isRefining: Boolean(base64Data),
-        },
-      ])
-
       if (!base64Data) return
       setInFlightCount((c) => c + 1)
 
@@ -407,20 +380,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
             isRefining: false,
           }))
 
-          setTurns((prev) => {
-            if (prev.some((t) => t.id === pendingId)) {
-              const out = []
-              for (const item of prev) {
-                if (item.id === pendingId) {
-                  out.push(...finalizedTurns)
-                } else {
-                  out.push(item)
-                }
-              }
-              return out
-            }
-            return [...prev, ...finalizedTurns]
-          })
+          setTurns((prev) => [...prev, ...finalizedTurns])
 
           const lastTurn = res.turns[res.turns.length - 1]
           const langList = (lastTurn.languages || [])
@@ -429,26 +389,10 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
           setStatusMessage(
             `${lastTurn.speaker_label} · ${langList} (${res.processing_time}s)`,
           )
-        } else {
-          // If backend detected silence/no words, keep only if we had valid English preview text
-          setTurns((prev) =>
-            cleanPreview
-              ? prev.map((t) =>
-                  t.id === pendingId ? { ...t, isRefining: false } : t,
-                )
-              : prev.filter((t) => t.id !== pendingId),
-          )
         }
       } catch (err) {
         console.error("Transcription error:", err)
         setStatusMessage(`Error: ${err.message}`)
-        setTurns((prev) =>
-          cleanPreview
-            ? prev.map((t) =>
-                t.id === pendingId ? { ...t, isRefining: false } : t,
-              )
-            : prev.filter((t) => t.id !== pendingId),
-        )
         if (err.message && err.message.toLowerCase().includes("api key")) {
           setShowKeyEditor(true)
         }
@@ -456,7 +400,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
         setInFlightCount((c) => Math.max(0, c - 1))
       }
     },
-    [config, activeEngine, selectedLangs, scriptMode, speakers],
+    [config, activeEngine, selectedLangs, scriptMode],
   )
 
   const getPreviewLang = useCallback(() => {
@@ -739,6 +683,16 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
     selectedLangs.includes("en") &&
     selectedLangs.includes("hi")
 
+  const latestTurn = turns.length > 0 ? turns[turns.length - 1] : null
+  const showSubtitleTranslation =
+    !livePreviewText &&
+    latestTurn &&
+    config.showEnglishMeaning !== false &&
+    latestTurn.english_translation &&
+    latestTurn.english_translation.trim() !== "" &&
+    latestTurn.english_translation.trim().toLowerCase() !==
+      (latestTurn.text || "").trim().toLowerCase()
+
   return (
     <div className="pro-studio-layout">
       {/* Left Control Sidebar */}
@@ -778,7 +732,7 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                 setConfig((prev) => ({ ...prev, asrEngine: "gemini-cloud" }))
               }
             >
-              Gemini 2.5 Flash
+              Gemini 3.5 Flash
             </button>
             <button
               className={`pro-seg-btn ${activeEngine !== "gemini-cloud" ? "active" : ""}`}
@@ -1302,39 +1256,77 @@ export default function TranscriberApp({ config, setConfig, onOpenSettings }) {
                 )
               })}
 
-              {/* Live Speaking Stream Row */}
-              {isRecording && (
-                <div className="pro-turn-row live-row">
-                  <div className="pro-turn-avatar live-avatar">
-                    <span className="pro-live-pulse" />
-                  </div>
-                  <div className="pro-turn-body">
-                    <div className="pro-turn-meta">
-                      <span className="pro-live-badge">Live Microphone</span>
-                      <span className="pro-turn-timestamp">
-                        {formatTimer(recordingSeconds)}
-                      </span>
-                    </div>
-                    <div className="pro-turn-transcript live-text">
-                      {livePreviewText || "Listening..."}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {isProcessing && (
-                <div className="pro-processing-bar">
-                  <span className="pro-spinner" />
-                  <span>
-                    Diarizing speaker & transcribing phrase...
-                  </span>
-                </div>
-              )}
-
               <div ref={feedEndRef} />
             </div>
           )}
         </main>
+
+        {/* Pinned Cinema Live Subtitle Stage — stays anchored above dock without shifting layout */}
+        {(isRecording || isProcessing || latestTurn) && (
+          <section className="pro-subtitle-stage" aria-live="polite">
+            <div
+              className={`pro-subtitle-box ${
+                isRecording ? "is-listening" : ""
+              }`}
+            >
+              <div className="pro-subtitle-meta">
+                {isRecording && (
+                  <span className="pro-subtitle-live-pill">
+                    <span className="pro-live-pulse" />
+                    <span>LIVE SUBTITLES</span>
+                  </span>
+                )}
+                {!livePreviewText && latestTurn && (
+                  <>
+                    <span
+                      className="pro-subtitle-speaker"
+                      style={{ color: latestTurn.speaker_color || "#818cf8" }}
+                    >
+                      {latestTurn.speaker_label}
+                    </span>
+                    {(latestTurn.languages || []).map((l, i) => {
+                      const st = getLangStyle(l.code)
+                      return (
+                        <span
+                          key={l.code + i}
+                          className="pro-subtitle-lang"
+                          style={{
+                            background: st.bg,
+                            color: st.text,
+                            borderColor: st.border,
+                          }}
+                        >
+                          {l.name}
+                        </span>
+                      )
+                    })}
+                  </>
+                )}
+                {isProcessing && (
+                  <span className="pro-subtitle-decoding">
+                    <span className="pro-spinner" />
+                    <span>Decoding speech...</span>
+                  </span>
+                )}
+              </div>
+
+              <div className="pro-subtitle-primary">
+                {livePreviewText
+                  ? livePreviewText
+                  : latestTurn
+                    ? latestTurn.text
+                    : "Listening to audio — subtitles will appear here as speech is detected..."}
+              </div>
+
+              {showSubtitleTranslation && (
+                <div className="pro-subtitle-translation">
+                  <span className="pro-subtitle-en-tag">EN</span>
+                  <span>{latestTurn.english_translation}</span>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
 
         {/* Floating Bottom Control Dock */}
         <footer className="pro-dock-wrapper">

@@ -1214,15 +1214,7 @@ class MultilingualTranscriber:
         t0 = time.time()
         audio_np = np.asarray(audio_np, dtype=np.float32)
         total_duration = round(len(audio_np) / float(SAMPLE_RATE), 2)
-
-        is_gemini = engine_mode == "gemini-cloud"
-        regions = extract_speech_regions_with_vad(
-            audio_np,
-            sr=SAMPLE_RATE,
-            max_segment_sec=12.0 if is_gemini else 6.0,
-            min_silence_ms=950 if is_gemini else 450,
-        )
-        if not regions:
+        if len(audio_np) < int(SAMPLE_RATE * 0.25):
             return {
                 "turns": [],
                 "speakers": self.diarizer.get_speakers_summary(),
@@ -1231,10 +1223,47 @@ class MultilingualTranscriber:
                 "engine": engine_mode,
             }
 
+        raw_peak = float(np.max(np.abs(audio_np)))
+        raw_rms = float(np.sqrt(np.mean(audio_np * audio_np)))
+        if raw_peak < 0.003 or raw_rms < 0.0008:
+            return {
+                "turns": [],
+                "speakers": self.diarizer.get_speakers_summary(),
+                "duration": total_duration,
+                "processing_time": round(time.time() - t0, 2),
+                "engine": engine_mode,
+            }
+
+        # Normalize audio before VAD so soft voices or external speaker/phone audio are detected reliably
+        if raw_peak < 0.55:
+            gain = min(18.0, 0.80 / max(raw_peak, 1e-4))
+            audio_np = np.clip(audio_np * gain, -0.98, 0.98).astype(np.float32)
+
+        is_gemini = engine_mode == "gemini-cloud"
+        regions = extract_speech_regions_with_vad(
+            audio_np,
+            sr=SAMPLE_RATE,
+            max_segment_sec=12.0 if is_gemini else 6.0,
+            min_silence_ms=950 if is_gemini else 450,
+        )
+        # If Silero VAD missed soft/external audio on a short live chunk that clearly has signal,
+        # pass the whole chunk to Gemini so live subtitles never drop out.
+        if not regions:
+            if total_duration <= 10.0 and raw_rms >= 0.0025:
+                regions = [(0, len(audio_np))]
+            else:
+                return {
+                    "turns": [],
+                    "speakers": self.diarizer.get_speakers_summary(),
+                    "duration": total_duration,
+                    "processing_time": round(time.time() - t0, 2),
+                    "engine": engine_mode,
+                }
+
         valid_segments: List[Tuple[int, int, np.ndarray]] = []
         for s_samp, e_samp in regions:
             sub_audio = audio_np[s_samp:e_samp]
-            if np.max(np.abs(sub_audio)) >= 0.015:
+            if np.max(np.abs(sub_audio)) >= 0.01:
                 valid_segments.append((s_samp, e_samp, sub_audio))
 
         if not valid_segments:

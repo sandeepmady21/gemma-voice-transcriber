@@ -248,14 +248,14 @@ export function useAudioRecorder() {
         }
 
         const callbackDurationSec = bufferSize / actualSampleRate
-        // Wait for a natural sentence pause (~0.85s) so words are never cut in half
+        // Flush subtitle phrase after ~0.65s of true silence once speech/audio has started
         const silenceCallbacksForCut = Math.max(
-          14,
-          Math.round(0.85 / callbackDurationSec),
+          11,
+          Math.round(0.65 / callbackDurationSec),
         )
-        // Or stream after ~6.0s of continuous speech at a natural breath dip
-        const maxCallbacksPerChunk = Math.round(6.0 / callbackDurationSec)
-        const preRollFrames = Math.max(7, Math.round(0.35 / callbackDurationSec))
+        // Or stream rolling subtitle window every ~3.6s of continuous audio
+        const maxCallbacksPerChunk = Math.round(3.6 / callbackDurationSec)
+        const preRollFrames = Math.max(7, Math.round(0.32 / callbackDurationSec))
 
         scriptProcessor.onaudioprocess = (e) => {
           const inputData = e.inputBuffer.getChannelData(0)
@@ -271,17 +271,18 @@ export function useAudioRecorder() {
             const st = vadStateRef.current
             st.totalFrames += 1
 
-            if (rms > 0.012) {
+            // Sensitive threshold (0.0045) picks up both direct mic speech and external audio/phone playback
+            if (rms > 0.0045) {
               st.voicedFrames += 1
               st.silenceFrames = 0
-              if (st.voicedFrames >= 4) {
+              if (st.voicedFrames >= 3) {
                 st.hasSpokenInChunk = true
               }
-            } else {
+            } else if (rms <= 0.0032) {
               st.silenceFrames += 1
             }
 
-            // Trim leading silence so chunks start ~0.35s before speech onset
+            // Trim leading silence so chunks start ~0.32s before speech onset
             if (
               !st.hasSpokenInChunk &&
               recordedSamplesRef.current.length > preRollFrames
@@ -292,16 +293,16 @@ export function useAudioRecorder() {
 
             const pauseReached =
               st.hasSpokenInChunk &&
-              st.voicedFrames >= 6 &&
+              st.voicedFrames >= 8 &&
               st.silenceFrames >= silenceCallbacksForCut
             const maxLenReached =
               st.hasSpokenInChunk &&
               st.totalFrames >= maxCallbacksPerChunk &&
-              (rms < 0.016 || st.totalFrames >= Math.round(7.5 / callbackDurationSec))
+              (rms < 0.012 || st.totalFrames >= Math.round(4.4 / callbackDurationSec))
 
             if (pauseReached || maxLenReached) {
               const overlap = maxLenReached
-                ? recordedSamplesRef.current.slice(-5)
+                ? recordedSamplesRef.current.slice(-6)
                 : recordedSamplesRef.current.slice(-3)
               const chunkToFlush = recordedSamplesRef.current.slice()
               recordedSamplesRef.current = overlap
@@ -323,7 +324,7 @@ export function useAudioRecorder() {
                 .then((res) => {
                   if (
                     res &&
-                    res.durationSec >= 0.5 &&
+                    res.durationSec >= 0.45 &&
                     chunkCallbackRef.current
                   ) {
                     chunkCallbackRef.current({
